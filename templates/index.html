@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bharat Stocks — Indian Market Analysis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">₹</span>
+      <div>
+        <h1>Bharat&nbsp;Stocks</h1>
+        <p class="tag">Indian Market Analysis &amp; Signals · NSE / BSE</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="analyze">Analyze</button>
+      <button class="tab" data-tab="screener">Screener</button>
+    </nav>
+  </header>
+
+  <div class="disclaimer">
+    ⚠️ Educational decision-support only — algorithmic technical signals, <strong>not investment advice</strong>. Markets carry risk; verify before trading.
+  </div>
+
+  <!-- ANALYZE VIEW -->
+  <main id="analyze-view" class="view active">
+    <section class="controls">
+      <div class="search-wrap">
+        <input id="search" type="text" placeholder="Search a stock (e.g. Reliance, TCS, INFY)…" autocomplete="off" />
+        <div id="suggestions" class="suggestions hidden"></div>
+      </div>
+      <div class="exchange-toggle">
+        <button class="ex active" data-ex="NSE">NSE</button>
+        <button class="ex" data-ex="BSE">BSE</button>
+      </div>
+      <button id="analyzeBtn" class="primary">Analyze</button>
+    </section>
+
+    <div id="loader" class="loader hidden"><div class="spinner"></div><span>Fetching market data…</span></div>
+    <div id="errorBox" class="errorbox hidden"></div>
+
+    <section id="result" class="result hidden">
+      <div class="stock-head">
+        <div>
+          <h2 id="stockName">—</h2>
+          <p id="stockMeta" class="muted"></p>
+        </div>
+        <div class="price-block">
+          <span id="stockPrice" class="price">—</span>
+          <span id="stockChange" class="change"></span>
+        </div>
+      </div>
+
+      <div class="stat-strip" id="statStrip"></div>
+
+      <div class="rec-grid">
+        <div class="rec-card" id="rec-intraday"></div>
+        <div class="rec-card" id="rec-short_term"></div>
+        <div class="rec-card" id="rec-long_term"></div>
+      </div>
+
+      <div class="chart-card">
+        <div id="priceChart" class="chart"></div>
+        <div id="rsiChart" class="chart small"></div>
+        <div id="macdChart" class="chart small"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- SCREENER VIEW -->
+  <main id="screener-view" class="view">
+    <section class="controls">
+      <div class="seg" id="horizonSeg">
+        <button class="seg-btn active" data-h="intraday">Intraday</button>
+        <button class="seg-btn" data-h="short_term">Short-term</button>
+        <button class="seg-btn" data-h="long_term">Long-term</button>
+      </div>
+      <div class="exchange-toggle">
+        <button class="ex2 active" data-ex="NSE">NSE</button>
+        <button class="ex2" data-ex="BSE">BSE</button>
+      </div>
+      <button id="scanBtn" class="primary">Scan Market</button>
+    </section>
+
+    <div id="scanLoader" class="loader hidden"><div class="spinner"></div><span>Scanning Nifty universe… this takes ~20–40s</span></div>
+
+    <section id="screenResult" class="screen-result hidden">
+      <div class="screen-cols">
+        <div class="screen-col">
+          <h3 class="buy-h">▲ Top Buy Candidates</h3>
+          <div id="buyList" class="screen-list"></div>
+        </div>
+        <div class="screen-col">
+          <h3 class="sell-h">▼ Top Sell / Avoid</h3>
+          <div id="sellList" class="screen-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">Data via Yahoo Finance (NSE/BSE). Cached 15&nbsp;min. Built for educational use.</footer>
+
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

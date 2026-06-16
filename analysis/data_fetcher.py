@@ -1,0 +1,141 @@
+"""Historical price data fetching for Indian stocks via yfinance.
+
+NSE/BSE do not offer a reliable public bulk API (their site actively blocks
+automated requests). yfinance proxies Yahoo Finance, which carries clean
+historical OHLCV data for both NSE (``.NS``) and BSE (``.BO``) listings and is
+the most dependable free source. A simple in-memory TTL cache avoids hammering
+the upstream service when the screener scans many symbols.
+"""
+
+from __future__ import annotations
+
+import time
+import threading
+from dataclasses import dataclass
+
+import pandas as pd
+import yfinance as yf
+
+from . import universe
+
+_CACHE_TTL_SECONDS = 60 * 15  # 15 minutes
+_cache: dict[tuple, tuple[float, object]] = {}
+_lock = threading.Lock()
+
+
+def _cache_get(key):
+    with _lock:
+        item = _cache.get(key)
+        if item is None:
+            return None
+        ts, value = item
+        if time.time() - ts > _CACHE_TTL_SECONDS:
+            _cache.pop(key, None)
+            return None
+        return value
+
+
+def _cache_set(key, value):
+    with _lock:
+        _cache[key] = (time.time(), value)
+
+
+@dataclass
+class StockData:
+    symbol: str            # base symbol, e.g. RELIANCE
+    exchange: str          # NSE or BSE
+    yahoo_ticker: str      # e.g. RELIANCE.NS
+    name: str
+    history: pd.DataFrame  # daily OHLCV, DatetimeIndex
+    intraday: pd.DataFrame # 5-minute bars for the latest sessions (may be empty)
+    info: dict             # fundamentals / metadata from yfinance
+
+
+def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.rename(columns=str.title)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    df = df[keep].copy()
+    df = df.dropna(subset=["Close"])
+    # Drop timezone for clean JSON serialisation downstream.
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+    return df
+
+
+def get_daily_history(symbol: str, exchange: str = "NSE", period: str = "2y") -> pd.DataFrame:
+    """Daily OHLCV history. Cached per (ticker, period)."""
+    ticker = universe.to_yahoo(symbol, exchange)
+    key = ("daily", ticker, period)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+    df = _clean_ohlcv(df)
+    _cache_set(key, df)
+    return df
+
+
+def get_intraday(symbol: str, exchange: str = "NSE", period: str = "5d",
+                 interval: str = "5m") -> pd.DataFrame:
+    """Intraday OHLCV bars. Cached per (ticker, period, interval)."""
+    ticker = universe.to_yahoo(symbol, exchange)
+    key = ("intraday", ticker, period, interval)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    try:
+        df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+        df = _clean_ohlcv(df)
+    except Exception:
+        df = pd.DataFrame()
+    _cache_set(key, df)
+    return df
+
+
+def get_info(symbol: str, exchange: str = "NSE") -> dict:
+    """Fundamental metadata (PE, market cap, 52w range, etc.). Best-effort."""
+    ticker = universe.to_yahoo(symbol, exchange)
+    key = ("info", ticker)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    info = {}
+    try:
+        raw = yf.Ticker(ticker).info or {}
+        wanted = [
+            "longName", "shortName", "sector", "industry", "currency",
+            "marketCap", "trailingPE", "forwardPE", "priceToBook",
+            "dividendYield", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+            "beta", "returnOnEquity", "profitMargins", "debtToEquity",
+            "earningsGrowth", "revenueGrowth", "recommendationKey",
+            "targetMeanPrice", "averageVolume",
+        ]
+        info = {k: raw.get(k) for k in wanted if raw.get(k) is not None}
+    except Exception:
+        info = {}
+    _cache_set(key, info)
+    return info
+
+
+def load_stock(symbol: str, exchange: str = "NSE", with_intraday: bool = True,
+               with_info: bool = True, period: str = "2y") -> StockData:
+    """Load everything needed to analyse a single stock."""
+    ticker = universe.to_yahoo(symbol, exchange)
+    base = symbol.upper().replace(".NS", "").replace(".BO", "")
+    name = universe.SYMBOL_TO_NAME.get(base, base)
+
+    history = get_daily_history(symbol, exchange, period=period)
+    intraday = get_intraday(symbol, exchange) if with_intraday else pd.DataFrame()
+    info = get_info(symbol, exchange) if with_info else {}
+
+    return StockData(
+        symbol=base,
+        exchange=exchange.upper(),
+        yahoo_ticker=ticker,
+        name=name,
+        history=history,
+        intraday=intraday,
+        info=info,
+    )
