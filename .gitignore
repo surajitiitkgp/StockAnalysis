@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Runtime auth/session artifacts (never commit secrets or user data)
+analysis/data/users.json
+analysis/data/.secret_key
+
+# Local historical price archive (large; regenerate with scripts/download_history.py)
+analysis/data/history.db
+analysis/data/history.db-wal
+analysis/data/history.db-shm

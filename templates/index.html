@@ -22,6 +22,11 @@
       <button class="tab active" data-tab="analyze">Analyze</button>
       <button class="tab" data-tab="screener">Screener</button>
     </nav>
+    <div class="user-area">
+      <span class="universe-badge" title="Stocks available for search">{{ stock_count }} stocks</span>
+      {% if user %}<span class="user-name">{{ user }}</span>{% endif %}
+      <a class="logout-btn" href="{{ url_for('logout') }}">Logout</a>
+    </div>
   </header>
 
   <div class="disclaimer">
@@ -65,6 +70,19 @@
         <div class="rec-card" id="rec-long_term"></div>
       </div>
 
+      <section id="predictCard" class="predict-card hidden">
+        <div class="predict-head">
+          <div>
+            <span class="predict-title">🤖 ML Price Forecast</span>
+            <span class="predict-sub">Random Forest regression · 7-trading-day horizon</span>
+          </div>
+          <span id="predictVerdict" class="verdict"></span>
+        </div>
+        <div id="predictBody" class="predict-body"></div>
+        <div id="predictChart" class="chart small"></div>
+        <p class="predict-foot" id="predictFoot"></p>
+      </section>
+
       <div class="chart-card">
         <div id="priceChart" class="chart"></div>
         <div id="rsiChart" class="chart small"></div>
@@ -88,7 +106,7 @@
       <button id="scanBtn" class="primary">Scan Market</button>
     </section>
 
-    <div id="scanLoader" class="loader hidden"><div class="spinner"></div><span>Scanning Nifty universe… this takes ~20–40s</span></div>
+    <div id="scanLoader" class="loader hidden"><div class="spinner"></div><span>Scanning the most liquid NSE stocks… this takes ~20–40s</span></div>
 
     <section id="screenResult" class="screen-result hidden">
       <div class="screen-cols">

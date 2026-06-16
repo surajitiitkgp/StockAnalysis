@@ -15,17 +15,79 @@ NOT investment advice.
 from __future__ import annotations
 
 import math
+import os
+import secrets
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from flask_cors import CORS
 
-from analysis import data_fetcher, indicators, strategy, universe
+from analysis import auth, data_fetcher, indicators, predictor, strategy, universe
 
 app = Flask(__name__)
 CORS(app)
+
+# --- Session / auth setup ------------------------------------------------- #
+# A stable secret key keeps users logged in across restarts. Override in
+# production with the SECRET_KEY env var.
+_SECRET_PATH = os.path.join(os.path.dirname(__file__), "analysis", "data", ".secret_key")
+
+
+def _load_secret_key() -> str:
+    env = os.environ.get("SECRET_KEY")
+    if env:
+        return env
+    try:
+        if os.path.exists(_SECRET_PATH):
+            with open(_SECRET_PATH, "r", encoding="utf-8") as fh:
+                return fh.read().strip()
+        key = secrets.token_hex(32)
+        os.makedirs(os.path.dirname(_SECRET_PATH), exist_ok=True)
+        with open(_SECRET_PATH, "w", encoding="utf-8") as fh:
+            fh.write(key)
+        return key
+    except Exception:  # noqa: BLE001
+        return secrets.token_hex(32)
+
+
+app.secret_key = _load_secret_key()
+auth.ensure_default_user()
+
+
+def login_required(view):
+    """Protect page routes — redirect to the login screen when logged out."""
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("user"):
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def api_login_required(view):
+    """Protect API routes — return 401 JSON when logged out."""
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("user"):
+            return jsonify({"error": "authentication required"}), 401
+        return view(*args, **kwargs)
+
+    return wrapped
+
 
 CHART_DAYS = 200  # how many recent daily bars to send to the chart
 
@@ -107,17 +169,55 @@ def _info_payload(stock: data_fetcher.StockData, df: pd.DataFrame) -> dict:
     }
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user"):
+        return redirect(url_for("index"))
+
+    error = None
+    mode = request.form.get("mode", "login")
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if mode == "register":
+            confirm = request.form.get("confirm", "")
+            if password != confirm:
+                error = "Passwords do not match."
+            else:
+                ok, msg = auth.create_user(username, password)
+                if ok:
+                    session["user"] = username.lower()
+                    return redirect(request.args.get("next") or url_for("index"))
+                error = msg
+        else:
+            if auth.verify(username, password):
+                session["user"] = username.lower()
+                return redirect(request.args.get("next") or url_for("index"))
+            error = "Invalid username or password."
+
+    return render_template("login.html", error=error, mode=mode)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
 @app.route("/")
+@login_required
 def index():
-    return render_template("index.html")
+    return render_template("index.html", user=session.get("user"), stock_count=universe.count())
 
 
 @app.route("/api/stocks")
+@api_login_required
 def api_stocks():
     return jsonify(universe.all_symbols())
 
 
 @app.route("/api/search")
+@api_login_required
 def api_search():
     q = request.args.get("q", "")
     if not q:
@@ -126,6 +226,7 @@ def api_search():
 
 
 @app.route("/api/analyze")
+@api_login_required
 def api_analyze():
     symbol = request.args.get("symbol", "").strip()
     exchange = request.args.get("exchange", "NSE").strip().upper()
@@ -141,11 +242,29 @@ def api_analyze():
 
     df = indicators.add_daily_indicators(stock.history)
     recommendations = strategy.analyze(stock)
+    try:
+        prediction = predictor.predict(symbol, exchange)
+    except Exception as exc:  # noqa: BLE001 - never fail the whole analysis on ML errors
+        prediction = {"available": False, "reason": f"model error: {exc}", "verdict": "HOLD"}
     return jsonify({
         "info": _info_payload(stock, df),
         "chart": _chart_payload(df),
         "recommendations": recommendations,
+        "prediction": prediction,
     })
+
+
+@app.route("/api/predict")
+@api_login_required
+def api_predict():
+    symbol = request.args.get("symbol", "").strip()
+    exchange = request.args.get("exchange", "NSE").strip().upper()
+    if not symbol:
+        return jsonify({"error": "symbol is required"}), 400
+    try:
+        return jsonify(predictor.predict(symbol, exchange))
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"prediction failed: {exc}"}), 502
 
 
 def _screen_one(item: dict, exchange: str, horizon: str):
@@ -188,15 +307,24 @@ def _screen_one(item: dict, exchange: str, horizon: str):
 
 
 @app.route("/api/screener")
+@api_login_required
 def api_screener():
     horizon = request.args.get("horizon", "short_term").strip()
     exchange = request.args.get("exchange", "NSE").strip().upper()
     if horizon not in ("intraday", "short_term", "long_term"):
         return jsonify({"error": "invalid horizon"}), 400
 
-    stocks = universe.all_symbols()
+    # Scanning every NSE stock live would be very slow / rate-limited, so the
+    # screener scans the most liquid names first, capped by ``limit``.
+    try:
+        limit = int(request.args.get("limit", 150))
+    except (TypeError, ValueError):
+        limit = 150
+    limit = max(10, min(limit, universe.count()))
+
+    stocks = universe.screener_symbols(limit)
     results = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=12) as pool:
         futures = [pool.submit(_screen_one, item, exchange, horizon) for item in stocks]
         for fut in futures:
             r = fut.result()
@@ -209,6 +337,7 @@ def api_screener():
     return jsonify({
         "horizon": horizon,
         "exchange": exchange,
+        "scanned": len(stocks),
         "count": len(results),
         "top_buys": buys[:12],
         "top_sells": sells[-12:][::-1] if sells else [],

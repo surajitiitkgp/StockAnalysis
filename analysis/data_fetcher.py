@@ -12,11 +12,12 @@ from __future__ import annotations
 import time
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import pandas as pd
 import yfinance as yf
 
-from . import universe
+from . import store, universe
 
 _CACHE_TTL_SECONDS = 60 * 15  # 15 minutes
 _cache: dict[tuple, tuple[float, object]] = {}
@@ -64,15 +65,74 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _period_to_start(period: str) -> str | None:
+    """Translate a yfinance-style period (e.g. '2y', '6mo', 'max') to a start date."""
+    period = (period or "").strip().lower()
+    if not period or period == "max":
+        return None
+    try:
+        if period.endswith("y"):
+            days = int(float(period[:-1]) * 365.25)
+        elif period.endswith("mo"):
+            days = int(float(period[:-2]) * 30.4)
+        elif period.endswith("d"):
+            days = int(period[:-1])
+        else:
+            return None
+    except ValueError:
+        return None
+    return (datetime.now() - timedelta(days=days + 5)).strftime("%Y-%m-%d")
+
+
+def _fetch_remote_daily(ticker: str, period: str) -> pd.DataFrame:
+    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+    return _clean_ohlcv(df)
+
+
 def get_daily_history(symbol: str, exchange: str = "NSE", period: str = "2y") -> pd.DataFrame:
-    """Daily OHLCV history. Cached per (ticker, period)."""
+    """Daily OHLCV history — local SQLite store first, Yahoo as top-up/fallback.
+
+    For NSE we keep a local 10-year archive (see ``scripts/download_history.py``).
+    We serve from there for speed/offline use, and top up the latest bars from
+    Yahoo when the stored copy is a few days stale. BSE always goes to Yahoo.
+    """
     ticker = universe.to_yahoo(symbol, exchange)
     key = ("daily", ticker, period)
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
-    df = _clean_ohlcv(df)
+
+    base = symbol.upper().replace(".NS", "").replace(".BO", "")
+    start = _period_to_start(period)
+
+    # BSE (or any pre-suffixed BSE ticker) is not in the local store -> remote.
+    use_store = exchange.upper() == "NSE" and not symbol.upper().endswith(".BO")
+
+    df = pd.DataFrame()
+    if use_store:
+        stored = store.get_history(base)
+        if not stored.empty:
+            last = stored.index.max()
+            # Top up recent bars if the local copy is more than ~3 days stale.
+            if (datetime.now() - last.to_pydatetime()) > timedelta(days=3):
+                try:
+                    fresh = _fetch_remote_daily(ticker, "1mo")
+                    if not fresh.empty:
+                        store.upsert_history(base, fresh)
+                        stored = store.get_history(base)
+                except Exception:  # noqa: BLE001 - offline: serve what we have
+                    pass
+            df = stored if start is None else stored[stored.index >= start]
+
+    if df.empty:
+        # No local data (new symbol / BSE / empty store) -> fetch & persist.
+        df = _fetch_remote_daily(ticker, period)
+        if use_store and not df.empty:
+            try:
+                store.upsert_history(base, df)
+            except Exception:  # noqa: BLE001
+                pass
+
     _cache_set(key, df)
     return df
 

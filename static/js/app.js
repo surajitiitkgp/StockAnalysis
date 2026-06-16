@@ -9,6 +9,16 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+// Wrap fetch so an expired session bounces the user back to login.
+async function apiFetch(url) {
+  const res = await fetch(url);
+  if (res.status === 401) {
+    window.location.href = "/login";
+    throw new Error("Session expired. Redirecting to login…");
+  }
+  return res;
+}
+
 // ----- Tab switching -----
 document.querySelectorAll(".tab").forEach((t) => {
   t.addEventListener("click", () => {
@@ -62,7 +72,7 @@ document.addEventListener("click", (e) => {
 
 async function fetchSuggestions(q) {
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+    const res = await apiFetch(`/api/search?q=${encodeURIComponent(q)}`);
     const data = await res.json();
     if (!data.length) { sugEl.classList.add("hidden"); return; }
     sugEl.innerHTML = data
@@ -95,7 +105,7 @@ async function analyze() {
   hide("errorBox"); hide("result"); show("loader");
   try {
     const url = `/api/analyze?symbol=${encodeURIComponent(state.selected.symbol)}&exchange=${state.exchange}`;
-    const res = await fetch(url);
+    const res = await apiFetch(url);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Analysis failed");
     renderResult(data);
@@ -150,7 +160,76 @@ function renderResult(data) {
     renderRec($("rec-" + h), labels[h], data.recommendations[h]);
   });
 
+  renderPrediction(data.prediction);
   drawCharts(data.chart);
+}
+
+function renderPrediction(p) {
+  const card = $("predictCard");
+  if (!p || !p.available) {
+    card.classList.remove("hidden");
+    $("predictVerdict").textContent = "N/A";
+    $("predictVerdict").className = "verdict v-hold";
+    $("predictBody").innerHTML =
+      `<div class="predict-note">${(p && p.reason) || "Forecast unavailable for this stock."}</div>`;
+    $("predictFoot").textContent = "";
+    try { Plotly.purge("predictChart"); } catch (_) {}
+    return;
+  }
+
+  card.classList.remove("hidden");
+  const v = $("predictVerdict");
+  v.textContent = p.verdict;
+  v.className = "verdict " + verdictClass(p.verdict);
+
+  const up = p.expected_return_pct >= 0;
+  const m = p.metrics || {};
+  $("predictBody").innerHTML = `
+    <div class="predict-grid">
+      <div class="pstat"><div class="k">Current</div><div class="val">₹${fmt(p.last_price)}</div></div>
+      <div class="pstat"><div class="k">Forecast (${p.horizon_days}d)</div>
+        <div class="val ${up ? "up" : "down"}">₹${fmt(p.forecast_price)}</div></div>
+      <div class="pstat"><div class="k">Expected move</div>
+        <div class="val ${up ? "up" : "down"}">${up ? "+" : ""}${fmt(p.expected_return_pct)}%</div></div>
+      <div class="pstat"><div class="k">Confidence</div><div class="val">${fmt(p.confidence, 0)}%</div></div>
+      <div class="pstat"><div class="k">Dir. accuracy</div><div class="val">${fmt(m.directional_accuracy_pct, 0)}%</div></div>
+      <div class="pstat"><div class="k">Backtest error</div><div class="val">±${fmt(m.mae_pct)}%</div></div>
+    </div>`;
+
+  $("predictFoot").textContent =
+    `Trained on ${p.train_samples} samples (${p.history_days} trading days). ` +
+    `Target date ≈ ${p.forecast_date}. Key drivers: ` +
+    (p.top_features || []).map((f) => f.name).join(", ") +
+    ". Statistical estimate — not investment advice.";
+
+  drawPredictChart(p.backtest, p.forecast_date, p.forecast_price, p.last_price);
+}
+
+function drawPredictChart(backtest, fDate, fPrice, lastPrice) {
+  if (!backtest || !backtest.length) { try { Plotly.purge("predictChart"); } catch (_) {} return; }
+  const dates = backtest.map((b) => b.date);
+  const actual = backtest.map((b) => b.actual);
+  const predicted = backtest.map((b) => b.predicted);
+
+  const actualTrace = {
+    type: "scatter", mode: "lines+markers", x: dates, y: actual,
+    name: "Actual", line: { color: "#4f8cff", width: 2 }, marker: { size: 6 },
+  };
+  const predTrace = {
+    type: "scatter", mode: "lines+markers", x: dates, y: predicted,
+    name: "Predicted", line: { color: "#ffb648", width: 2, dash: "dot" }, marker: { size: 6 },
+  };
+  const fwdTrace = {
+    type: "scatter", mode: "markers+text", x: [fDate], y: [fPrice],
+    name: "7d forecast", text: ["▲ forecast"], textposition: "top center",
+    marker: { size: 11, color: fPrice >= lastPrice ? "#1fd286" : "#ff5c7a", symbol: "diamond" },
+  };
+  const layout = {
+    ...layoutBase, margin: { l: 50, r: 20, t: 8, b: 28 },
+    yaxis: { ...layoutBase.yaxis, title: "₹" },
+    title: { text: "Last 7 days: predicted vs actual (+ forecast)", font: { size: 11, color: "#8a97b1" }, x: 0.02, y: 0.97 },
+  };
+  Plotly.newPlot("predictChart", [actualTrace, predTrace, fwdTrace], layout, config);
 }
 
 function renderRec(el, title, rec) {
@@ -251,7 +330,7 @@ $("scanBtn").addEventListener("click", scan);
 async function scan() {
   hide("screenResult"); show("scanLoader");
   try {
-    const res = await fetch(`/api/screener?horizon=${state.horizon}&exchange=${state.scanExchange}`);
+    const res = await apiFetch(`/api/screener?horizon=${state.horizon}&exchange=${state.scanExchange}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Scan failed");
     renderScreen(data);
