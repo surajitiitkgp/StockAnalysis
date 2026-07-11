@@ -5,6 +5,9 @@ const state = {
   scanExchange: "NSE",
   horizon: "intraday",
   selected: null,
+  model: "auto",
+  prediction: null,
+  activeHorizon: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -52,6 +55,23 @@ document.querySelectorAll(".seg-btn").forEach((b) => {
     state.horizon = b.dataset.h;
   });
 });
+
+// ----- Model selector (populated from /api/models) -----
+const modelSelect = $("modelSelect");
+modelSelect.addEventListener("change", () => { state.model = modelSelect.value; });
+
+async function loadModels() {
+  try {
+    const res = await apiFetch("/api/models");
+    const data = await res.json();
+    if (!data.models) return;
+    modelSelect.innerHTML = data.models
+      .map((m) => `<option value="${m.key}">${m.label}</option>`)
+      .join("");
+    modelSelect.value = state.model;
+  } catch (_) { /* keep the default option */ }
+}
+loadModels();
 
 // ----- Search with suggestions -----
 const searchEl = $("search");
@@ -104,7 +124,7 @@ async function analyze() {
   if (!state.selected) { showError("Please search and pick a stock first."); return; }
   hide("errorBox"); hide("result"); show("loader");
   try {
-    const url = `/api/analyze?symbol=${encodeURIComponent(state.selected.symbol)}&exchange=${state.exchange}`;
+    const url = `/api/analyze?symbol=${encodeURIComponent(state.selected.symbol)}&exchange=${state.exchange}&model=${encodeURIComponent(state.model)}`;
     const res = await apiFetch(url);
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Analysis failed");
@@ -160,16 +180,88 @@ function renderResult(data) {
     renderRec($("rec-" + h), labels[h], data.recommendations[h]);
   });
 
+  renderDataBadge(data.data);
   renderPrediction(data.prediction);
+  renderNews(data.news);
   drawCharts(data.chart);
+}
+
+function sentimentClass(label) {
+  if (label === "positive") return "v-buy";
+  if (label === "negative") return "v-sell";
+  return "v-hold";
+}
+
+function renderNews(n) {
+  const card = $("newsCard");
+  if (!n || !n.available) {
+    // Only show the card when there's something to say.
+    if (n && n.reason && /no news provider/i.test(n.reason)) {
+      card.classList.add("hidden");
+      return;
+    }
+    card.classList.remove("hidden");
+    $("newsSentiment").textContent = "N/A";
+    $("newsSentiment").className = "verdict v-hold";
+    $("newsSub").textContent = (n && n.reason) || "No recent news found.";
+    $("newsList").innerHTML = "";
+    return;
+  }
+
+  card.classList.remove("hidden");
+  const agg = n.aggregate || {};
+  const badge = $("newsSentiment");
+  badge.textContent = (agg.label || "neutral").toUpperCase();
+  badge.className = "verdict " + sentimentClass(agg.label);
+  $("newsSub").textContent =
+    `${n.provider || "news"} · ${agg.count || 0} articles · ` +
+    `${agg.positive || 0}▲ / ${agg.negative || 0}▼ · score ${fmt(agg.score, 2)}`;
+
+  const items = n.headlines || [];
+  $("newsList").innerHTML = items.length
+    ? items.map((h) => {
+        const cls = h.sentiment > 0.15 ? "up" : (h.sentiment < -0.15 ? "down" : "neu");
+        const src = [h.source, h.published_at].filter(Boolean).join(" · ");
+        const title = h.url
+          ? `<a href="${h.url}" target="_blank" rel="noopener">${h.title}</a>`
+          : h.title;
+        return `<div class="news-item">
+            <span class="news-dot ${cls}"></span>
+            <div class="news-body"><div class="news-h">${title}</div>
+            <div class="news-src">${src}</div></div>
+          </div>`;
+      }).join("")
+    : `<div class="predict-note">No recent headlines.</div>`;
+}
+
+function renderDataBadge(meta) {
+  const el = $("dataBadge");
+  if (!meta) { el.classList.add("hidden"); return; }
+  const f = meta.freshness || {};
+  const parts = [];
+  if (meta.provider) parts.push(`Source: ${meta.provider}`);
+  else if (meta.source) parts.push(`Source: ${meta.source}`);
+  if (f.last_date) parts.push(`As of ${f.last_date}`);
+  if (f.rows) parts.push(`${f.rows} bars`);
+  const stale = f.stale;
+  el.className = "data-badge" + (stale ? " stale" : "");
+  el.innerHTML =
+    `<span class="dot ${stale ? "bear" : "bull"}"></span>` +
+    `<span>${parts.join(" · ") || "Data loaded"}</span>` +
+    (stale ? `<span class="stale-tag">stale (${f.age_days}d old)</span>` : "");
+  el.classList.remove("hidden");
 }
 
 function renderPrediction(p) {
   const card = $("predictCard");
+  state.prediction = p;
+  card.classList.remove("hidden");
+
   if (!p || !p.available) {
-    card.classList.remove("hidden");
     $("predictVerdict").textContent = "N/A";
     $("predictVerdict").className = "verdict v-hold";
+    $("modelInfo").classList.add("hidden");
+    $("horizonSelect").classList.add("hidden");
     $("predictBody").innerHTML =
       `<div class="predict-note">${(p && p.reason) || "Forecast unavailable for this stock."}</div>`;
     $("predictFoot").textContent = "";
@@ -177,32 +269,84 @@ function renderPrediction(p) {
     return;
   }
 
-  card.classList.remove("hidden");
-  const v = $("predictVerdict");
-  v.textContent = p.verdict;
-  v.className = "verdict " + verdictClass(p.verdict);
+  // Model info + optional auto-selection scoreboard.
+  const mi = $("modelInfo");
+  const model = p.model || {};
+  let miHtml = `<span class="mi-label">Model:</span> <b>${model.label || model.key}</b>`;
+  if (model.selected_from === "auto") miHtml += ` <span class="mi-auto">auto-selected</span>`;
+  if (p.news_features_used) miHtml += ` <span class="mi-news">news-tuned</span>`;
+  if (p.news && p.news.available)
+    miHtml += ` <span class="mi-news">news ${p.news.label || ""} ${fmt(p.news.score, 2)}</span>`;
+  if (p.from_cache) miHtml += ` <span class="mi-cache">cached</span>`;
+  if (model.scoreboard && model.scoreboard.length) {
+    miHtml += `<div class="scoreboard">` +
+      model.scoreboard.map((s, idx) =>
+        `<span class="sb ${idx === 0 ? "best" : ""}">${s.label}: ${fmt(s.directional_accuracy_pct, 0)}%</span>`
+      ).join("") + `</div>`;
+  }
+  mi.innerHTML = miHtml;
+  mi.classList.remove("hidden");
 
-  const up = p.expected_return_pct >= 0;
-  const m = p.metrics || {};
+  $("predictSub").textContent =
+    `${model.label || "ML"} · horizons ${(p.horizons || []).map((h) => h.days + "d").join(" / ")}`;
+
+  // Horizon selector chips.
+  const horizons = p.horizons || [];
+  const primary = horizons.find((h) => h.days === (p.horizon_days || 7)) || horizons[0];
+  state.activeHorizon = state.activeHorizon && horizons.some((h) => h.days === state.activeHorizon)
+    ? state.activeHorizon : (primary ? primary.days : null);
+
+  const hs = $("horizonSelect");
+  hs.innerHTML = horizons.map((h) =>
+    `<button class="hz-btn ${h.days === state.activeHorizon ? "active" : ""}" data-h="${h.days}">
+       ${h.days}d
+       <span class="hz-move ${h.expected_return_pct >= 0 ? "up" : "down"}">${h.expected_return_pct >= 0 ? "+" : ""}${fmt(h.expected_return_pct, 1)}%</span>
+     </button>`).join("");
+  hs.classList.remove("hidden");
+  hs.querySelectorAll(".hz-btn").forEach((b) => {
+    b.addEventListener("click", () => {
+      state.activeHorizon = parseInt(b.dataset.h, 10);
+      renderHorizon();
+    });
+  });
+
+  renderHorizon();
+}
+
+function renderHorizon() {
+  const p = state.prediction;
+  if (!p || !p.available) return;
+  const h = (p.horizons || []).find((x) => x.days === state.activeHorizon) || p.horizons[0];
+  if (!h) return;
+
+  document.querySelectorAll(".hz-btn").forEach((b) =>
+    b.classList.toggle("active", parseInt(b.dataset.h, 10) === h.days));
+
+  const v = $("predictVerdict");
+  v.textContent = h.verdict;
+  v.className = "verdict " + verdictClass(h.verdict);
+
+  const up = h.expected_return_pct >= 0;
+  const m = h.metrics || {};
   $("predictBody").innerHTML = `
     <div class="predict-grid">
-      <div class="pstat"><div class="k">Current</div><div class="val">₹${fmt(p.last_price)}</div></div>
-      <div class="pstat"><div class="k">Forecast (${p.horizon_days}d)</div>
-        <div class="val ${up ? "up" : "down"}">₹${fmt(p.forecast_price)}</div></div>
+      <div class="pstat"><div class="k">Current</div><div class="val">₹${fmt(h.last_price)}</div></div>
+      <div class="pstat"><div class="k">Forecast (${h.days}d)</div>
+        <div class="val ${up ? "up" : "down"}">₹${fmt(h.forecast_price)}</div></div>
       <div class="pstat"><div class="k">Expected move</div>
-        <div class="val ${up ? "up" : "down"}">${up ? "+" : ""}${fmt(p.expected_return_pct)}%</div></div>
-      <div class="pstat"><div class="k">Confidence</div><div class="val">${fmt(p.confidence, 0)}%</div></div>
+        <div class="val ${up ? "up" : "down"}">${up ? "+" : ""}${fmt(h.expected_return_pct)}%</div></div>
+      <div class="pstat"><div class="k">Confidence</div><div class="val">${fmt(h.confidence, 0)}%</div></div>
       <div class="pstat"><div class="k">Dir. accuracy</div><div class="val">${fmt(m.directional_accuracy_pct, 0)}%</div></div>
-      <div class="pstat"><div class="k">Backtest error</div><div class="val">±${fmt(m.mae_pct)}%</div></div>
+      <div class="pstat"><div class="k">Backtest err (MAE)</div><div class="val">±${fmt(m.mae_pct)}%</div></div>
     </div>`;
 
   $("predictFoot").textContent =
-    `Trained on ${p.train_samples} samples (${p.history_days} trading days). ` +
-    `Target date ≈ ${p.forecast_date}. Key drivers: ` +
+    `Trained on ${p.train_samples} samples (${p.history_days} trading days), ${p.trained_at || ""}. ` +
+    `Target date ≈ ${h.forecast_date}. Walk-forward R²=${fmt(m.r2, 2)}. Key drivers: ` +
     (p.top_features || []).map((f) => f.name).join(", ") +
     ". Statistical estimate — not investment advice.";
 
-  drawPredictChart(p.backtest, p.forecast_date, p.forecast_price, p.last_price);
+  drawPredictChart(h.backtest, h.forecast_date, h.forecast_price, h.last_price);
 }
 
 function drawPredictChart(backtest, fDate, fPrice, lastPrice) {
@@ -379,6 +523,116 @@ function attachRowClicks() {
       analyze();
     });
   });
+}
+
+// ----- Settings modal -----
+const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+let settingsFields = [];
+
+function openSettings() {
+  show("settingsOverlay");
+  hide("settingsMsg");
+  $("settingsBody").innerHTML = '<div class="settings-loading">Loading…</div>';
+  loadSettings();
+}
+function closeSettings() { hide("settingsOverlay"); }
+
+$("settingsBtn").addEventListener("click", openSettings);
+$("settingsClose").addEventListener("click", closeSettings);
+$("settingsCancel").addEventListener("click", closeSettings);
+$("settingsOverlay").addEventListener("click", (e) => {
+  if (e.target.id === "settingsOverlay") closeSettings();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("settingsOverlay").classList.contains("hidden")) closeSettings();
+});
+
+async function loadSettings() {
+  try {
+    const res = await apiFetch("/api/config");
+    const data = await res.json();
+    settingsFields = data.settings || [];
+    renderSettings(settingsFields);
+  } catch (_) {
+    $("settingsBody").innerHTML = '<div class="settings-loading">Failed to load settings.</div>';
+  }
+}
+
+function renderSettings(fields) {
+  const groups = {};
+  fields.forEach((f) => { (groups[f.group] = groups[f.group] || []).push(f); });
+  const esc = (s) => String(s == null ? "" : s).replace(/"/g, "&quot;");
+
+  $("settingsBody").innerHTML = Object.keys(groups).map((g) => `
+    <div class="settings-group">
+      <h3>${g}</h3>
+      ${groups[g].map(fieldHtml).join("")}
+    </div>`).join("");
+
+  function fieldHtml(f) {
+    const help = f.help ? `<span class="set-help">${f.help}</span>` : "";
+    let control = "";
+    if (f.type === "bool") {
+      control = `<label class="switch">
+        <input type="checkbox" data-key="${f.key}" data-type="bool" ${f.value ? "checked" : ""}/>
+        <span class="slider"></span></label>`;
+    } else if (f.type === "int") {
+      control = `<input class="set-input" type="number" data-key="${f.key}" data-type="int"
+        value="${esc(f.value)}" ${f.min != null ? `min="${f.min}"` : ""} ${f.max != null ? `max="${f.max}"` : ""}/>`;
+    } else if (f.type === "secret") {
+      control = `<input class="set-input" type="password" data-key="${f.key}" data-type="secret"
+        placeholder="${f.configured ? "•••••••• (set — leave blank to keep)" : "not set"}" autocomplete="new-password"/>`;
+    } else {
+      control = `<input class="set-input" type="text" data-key="${f.key}" data-type="${f.type}" value="${esc(f.value)}"/>`;
+    }
+    return `<div class="set-row">
+      <div class="set-label"><span>${f.label}</span>${help}</div>
+      <div class="set-control">${control}</div>
+    </div>`;
+  }
+}
+
+$("settingsSave").addEventListener("click", saveSettings);
+
+async function saveSettings() {
+  const changes = {};
+  document.querySelectorAll("#settingsBody [data-key]").forEach((el) => {
+    const key = el.dataset.key;
+    const type = el.dataset.type;
+    if (type === "bool") {
+      changes[key] = el.checked;
+    } else if (type === "secret") {
+      if (el.value !== "") changes[key] = el.value;  // blank = keep current
+    } else {
+      changes[key] = el.value;
+    }
+  });
+
+  const btn = $("settingsSave");
+  btn.disabled = true; btn.textContent = "Saving…";
+  try {
+    const res = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({ changes }),
+    });
+    if (res.status === 401) { window.location.href = "/login"; return; }
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Save failed");
+    settingsMsg(`Saved ${data.applied.length} setting${data.applied.length === 1 ? "" : "s"}. Re-run Analyze to apply.`, true);
+    settingsFields = data.settings || settingsFields;
+    renderSettings(settingsFields);
+  } catch (e) {
+    settingsMsg(e.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = "Save changes";
+  }
+}
+
+function settingsMsg(text, ok) {
+  const el = $("settingsMsg");
+  el.textContent = text;
+  el.className = "settings-msg " + (ok ? "ok" : "err");
 }
 
 // ----- helpers -----

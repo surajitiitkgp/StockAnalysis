@@ -29,6 +29,7 @@
 
     <form method="POST" action="{{ url_for('login', next=request.args.get('next', '')) }}" class="auth-form" id="authForm">
       <input type="hidden" name="mode" id="modeField" value="{{ 'register' if mode == 'register' else 'login' }}" />
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
 
       <label class="auth-label">Username</label>
       <input class="auth-input" type="text" name="username" autocomplete="username" placeholder="your username" required autofocus />

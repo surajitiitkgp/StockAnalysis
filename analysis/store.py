@@ -17,21 +17,32 @@ import threading
 
 import pandas as pd
 
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-DB_PATH = os.path.join(_DATA_DIR, "history.db")
+from .config import settings
+from .logging_config import get_logger
+
+log = get_logger(__name__)
+
+_DATA_DIR = settings.data_dir
+DB_PATH = settings.db_path
 _local = threading.local()
+
+# Bump when the schema changes; migrations run in ``_migrate``.
+SCHEMA_VERSION = 1
 
 
 def _conn() -> sqlite3.Connection:
     """Thread-local connection (SQLite connections aren't shareable across threads)."""
     conn = getattr(_local, "conn", None)
     if conn is None:
-        os.makedirs(_DATA_DIR, exist_ok=True)
+        os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
         conn = sqlite3.connect(DB_PATH, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
         _local.conn = conn
         _init(conn)
+        _migrate(conn)
     return conn
 
 
@@ -51,7 +62,38 @@ def _init(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_symbol ON prices(symbol);")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+    # Self-accumulating daily news-sentiment archive. ``symbol`` may be a real
+    # ticker or the pseudo-symbol ``__MARKET__`` for market/geopolitical news.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sentiment_daily (
+            symbol    TEXT NOT NULL,
+            date      TEXT NOT NULL,
+            sentiment REAL,
+            article_count INTEGER,
+            PRIMARY KEY (symbol, date)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sent_symbol ON sentiment_daily(symbol);")
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply forward-only schema migrations based on the stored version."""
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    current = int(row[0]) if row and row[0] else 0
+    if current == 0:
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+            (str(SCHEMA_VERSION),),
+        )
+        conn.commit()
+        current = SCHEMA_VERSION
+    # Future migrations: `if current < 2: ...; current = 2` etc.
+    if current != SCHEMA_VERSION:
+        log.warning("store schema version %s != expected %s", current, SCHEMA_VERSION)
 
 
 def init_db() -> None:
@@ -145,3 +187,64 @@ def stats() -> dict:
 def exists() -> bool:
     """True if the DB file exists and has data."""
     return os.path.exists(DB_PATH) and row_count() > 0
+
+
+# --------------------------------------------------------------------------- #
+# News-sentiment archive
+# --------------------------------------------------------------------------- #
+MARKET_SYMBOL = "__MARKET__"
+
+
+def upsert_sentiment(symbol: str, series: list) -> int:
+    """Insert/replace daily sentiment rows.
+
+    ``series`` is a list of ``{"date", "sentiment", "count"}`` dicts. Existing
+    days are overwritten (the freshest fetch wins), so re-running the refresh
+    job keeps the archive current and progressively deeper.
+    """
+    if not series:
+        return 0
+    symbol = symbol.upper().strip()
+    rows = [(symbol, s["date"], _num(s.get("sentiment")), int(s.get("count") or 0))
+            for s in series if s.get("date")]
+    if not rows:
+        return 0
+    conn = _conn()
+    conn.executemany(
+        "INSERT OR REPLACE INTO sentiment_daily (symbol, date, sentiment, article_count) "
+        "VALUES (?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def get_sentiment(symbol: str, start: str | None = None) -> pd.DataFrame:
+    """Return stored daily sentiment for a symbol as a DatetimeIndex frame."""
+    symbol = symbol.upper().strip()
+    conn = _conn()
+    q = "SELECT date, sentiment, article_count FROM sentiment_daily WHERE symbol = ?"
+    params: list = [symbol]
+    if start:
+        q += " AND date >= ?"
+        params.append(start)
+    q += " ORDER BY date ASC"
+    df = pd.read_sql_query(q, conn, params=params)
+    if df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date")
+    df.columns = ["sentiment", "article_count"]
+    return df
+
+
+def sentiment_stats() -> dict:
+    conn = _conn()
+    try:
+        nsym = conn.execute("SELECT COUNT(DISTINCT symbol) FROM sentiment_daily").fetchone()[0]
+        nrows = conn.execute("SELECT COUNT(*) FROM sentiment_daily").fetchone()[0]
+        rng = conn.execute("SELECT MIN(date), MAX(date) FROM sentiment_daily").fetchone()
+    except Exception:  # noqa: BLE001
+        return {"symbols": 0, "rows": 0, "min_date": None, "max_date": None}
+    return {"symbols": int(nsym), "rows": int(nrows),
+            "min_date": rng[0], "max_date": rng[1]}

@@ -116,8 +116,9 @@ def _levels(entry: float, atr: float, direction: int, rr: float = 2.0,
 # --------------------------------------------------------------------------- #
 # Long-term (positional, months to years)
 # --------------------------------------------------------------------------- #
-def long_term(stock: StockData) -> Recommendation:
-    df = indicators.add_daily_indicators(stock.history)
+def long_term(stock: StockData, df: pd.DataFrame | None = None) -> Recommendation:
+    if df is None:
+        df = indicators.add_daily_indicators(stock.history)
     s = _Scorer()
     if df is None or df.empty or len(df) < 60:
         return Recommendation("long_term", "HOLD", 0, 0,
@@ -196,8 +197,9 @@ def long_term(stock: StockData) -> Recommendation:
 # --------------------------------------------------------------------------- #
 # Short-term (swing, days to a few weeks)
 # --------------------------------------------------------------------------- #
-def short_term(stock: StockData) -> Recommendation:
-    df = indicators.add_daily_indicators(stock.history)
+def short_term(stock: StockData, df: pd.DataFrame | None = None) -> Recommendation:
+    if df is None:
+        df = indicators.add_daily_indicators(stock.history)
     s = _Scorer()
     if df is None or df.empty or len(df) < 30:
         return Recommendation("short_term", "HOLD", 0, 0,
@@ -284,10 +286,10 @@ def short_term(stock: StockData) -> Recommendation:
 # --------------------------------------------------------------------------- #
 # Intraday (same-session momentum)
 # --------------------------------------------------------------------------- #
-def intraday(stock: StockData) -> Recommendation:
+def intraday(stock: StockData, df: pd.DataFrame | None = None) -> Recommendation:
     s = _Scorer()
     intra = stock.intraday
-    daily = indicators.add_daily_indicators(stock.history)
+    daily = df if df is not None else indicators.add_daily_indicators(stock.history)
 
     if daily is None or daily.empty:
         return Recommendation("intraday", "HOLD", 0, 0,
@@ -372,9 +374,14 @@ def intraday(stock: StockData) -> Recommendation:
 
 
 def analyze(stock: StockData) -> dict:
-    """Run all three horizons and return a serialisable dict."""
+    """Run all three horizons and return a serialisable dict.
+
+    Indicators are computed once and shared across horizons (they were
+    previously recomputed for each horizon and again for the chart).
+    """
+    df = indicators.add_daily_indicators(stock.history)
     return {
-        "intraday": intraday(stock).to_dict(),
-        "short_term": short_term(stock).to_dict(),
-        "long_term": long_term(stock).to_dict(),
+        "intraday": intraday(stock, df).to_dict(),
+        "short_term": short_term(stock, df).to_dict(),
+        "long_term": long_term(stock, df).to_dict(),
     }

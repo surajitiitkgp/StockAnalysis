@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="csrf-token" content="{{ csrf_token() }}" />
   <title>Bharat Stocks — Indian Market Analysis</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet" />
@@ -25,9 +26,27 @@
     <div class="user-area">
       <span class="universe-badge" title="Stocks available for search">{{ stock_count }} stocks</span>
       {% if user %}<span class="user-name">{{ user }}</span>{% endif %}
+      <button id="settingsBtn" class="settings-btn" title="Settings" aria-label="Settings">⚙</button>
       <a class="logout-btn" href="{{ url_for('logout') }}">Logout</a>
     </div>
   </header>
+
+  <!-- SETTINGS MODAL -->
+  <div id="settingsOverlay" class="modal-overlay hidden">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-head">
+        <h2 id="settingsTitle">⚙ Settings</h2>
+        <button id="settingsClose" class="modal-close" aria-label="Close">✕</button>
+      </div>
+      <p class="modal-note">Changes are saved live and persist across restarts. Some take effect on your next analysis. Secrets are write-only — leave blank to keep the current key.</p>
+      <div id="settingsBody" class="settings-body"><div class="settings-loading">Loading…</div></div>
+      <div id="settingsMsg" class="settings-msg hidden"></div>
+      <div class="modal-foot">
+        <button id="settingsCancel" class="ghost-btn">Cancel</button>
+        <button id="settingsSave" class="primary">Save changes</button>
+      </div>
+    </div>
+  </div>
 
   <div class="disclaimer">
     ⚠️ Educational decision-support only — algorithmic technical signals, <strong>not investment advice</strong>. Markets carry risk; verify before trading.
@@ -44,6 +63,9 @@
         <button class="ex active" data-ex="NSE">NSE</button>
         <button class="ex" data-ex="BSE">BSE</button>
       </div>
+      <select id="modelSelect" class="model-select" title="ML model used for the forecast">
+        <option value="auto">Auto (best per stock)</option>
+      </select>
       <button id="analyzeBtn" class="primary">Analyze</button>
     </section>
 
@@ -62,6 +84,8 @@
         </div>
       </div>
 
+      <div id="dataBadge" class="data-badge hidden"></div>
+
       <div class="stat-strip" id="statStrip"></div>
 
       <div class="rec-grid">
@@ -74,13 +98,26 @@
         <div class="predict-head">
           <div>
             <span class="predict-title">🤖 ML Price Forecast</span>
-            <span class="predict-sub">Random Forest regression · 7-trading-day horizon</span>
+            <span class="predict-sub" id="predictSub">Multi-horizon regression</span>
           </div>
           <span id="predictVerdict" class="verdict"></span>
         </div>
+        <div id="modelInfo" class="model-info hidden"></div>
+        <div id="horizonSelect" class="horizon-select hidden"></div>
         <div id="predictBody" class="predict-body"></div>
         <div id="predictChart" class="chart small"></div>
         <p class="predict-foot" id="predictFoot"></p>
+      </section>
+
+      <section id="newsCard" class="news-card hidden">
+        <div class="news-head">
+          <div>
+            <span class="news-title">📰 News &amp; Sentiment</span>
+            <span class="news-sub" id="newsSub"></span>
+          </div>
+          <span id="newsSentiment" class="verdict"></span>
+        </div>
+        <div id="newsList" class="news-list"></div>
       </section>
 
       <div class="chart-card">

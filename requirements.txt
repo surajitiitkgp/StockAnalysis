@@ -1,7 +1,26 @@
-Flask>=3.0
+Flask>=2.2
 flask-cors>=4.0
 yfinance>=0.2.40
 pandas>=2.0
 numpy>=1.24,<2
 gunicorn
 scikit-learn>=1.3
+joblib>=1.2
+
+# --- Optional (auto-detected at runtime) ---
+# redis>=5.0        # shared cache backend when REDIS_URL is set
+# sentry-sdk>=1.40  # error tracking when SENTRY_DSN is set
+#
+# News/sentiment AND extra price providers (Twelve Data, Alpha Vantage) are all
+# called over plain REST (no SDK required); just set the relevant API key(s).
+# These official SDKs are optional conveniences:
+# finnhub-python>=2.4   # Finnhub (FINNHUB_API_KEY)
+# eventregistry>=8.9    # NewsAPI.ai / EventRegistry (NEWSAPI_AI_KEY)
+#
+# Unofficial NSE India API — direct-from-source equity history + India VIX
+# (USE_NSE_API=true). Optional; the app degrades gracefully without it.
+# nse[local]>=3.1       # local/PC (requests);  nse[server] on cloud (httpx)
+
+# --- Dev / CI ---
+pytest>=7.4
+ruff>=0.4

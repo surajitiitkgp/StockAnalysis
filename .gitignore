@@ -7,8 +7,17 @@ venv/
 # Runtime auth/session artifacts (never commit secrets or user data)
 analysis/data/users.json
 analysis/data/.secret_key
+# GUI-editable runtime config (may contain API keys)
+analysis/data/runtime_config.json
 
 # Local historical price archive (large; regenerate with scripts/download_history.py)
 analysis/data/history.db
 analysis/data/history.db-wal
 analysis/data/history.db-shm
+
+# Persisted ML model bundles (regenerated on demand)
+analysis/data/models/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/

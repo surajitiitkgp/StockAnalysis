@@ -1,44 +1,30 @@
-"""Historical price data fetching for Indian stocks via yfinance.
+"""Historical price data fetching for Indian stocks (local-first, resilient).
 
-NSE/BSE do not offer a reliable public bulk API (their site actively blocks
-automated requests). yfinance proxies Yahoo Finance, which carries clean
-historical OHLCV data for both NSE (``.NS``) and BSE (``.BO``) listings and is
-the most dependable free source. A simple in-memory TTL cache avoids hammering
-the upstream service when the screener scans many symbols.
+Data flow:
+  1. Serve daily history from the local SQLite archive when available.
+  2. Top up recent bars from a provider (Yahoo, then Stooq fallback) when the
+     local copy is stale.
+  3. For symbols not in the store (BSE / brand-new), fetch from a provider and
+     persist.
+
+All fetches go through :mod:`analysis.providers` (retry + backoff + circuit
+breaker + validation) and results are cached via :mod:`analysis.cache`
+(shared/Redis-capable, single-flight). Every load carries freshness metadata so
+the API/UI can flag stale or degraded data instead of hiding it.
 """
 
 from __future__ import annotations
 
-import time
-import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import pandas as pd
-import yfinance as yf
 
-from . import store, universe
+from . import cache, providers, store, universe
+from .config import settings
+from .logging_config import get_logger
 
-_CACHE_TTL_SECONDS = 60 * 15  # 15 minutes
-_cache: dict[tuple, tuple[float, object]] = {}
-_lock = threading.Lock()
-
-
-def _cache_get(key):
-    with _lock:
-        item = _cache.get(key)
-        if item is None:
-            return None
-        ts, value = item
-        if time.time() - ts > _CACHE_TTL_SECONDS:
-            _cache.pop(key, None)
-            return None
-        return value
-
-
-def _cache_set(key, value):
-    with _lock:
-        _cache[key] = (time.time(), value)
+log = get_logger(__name__)
 
 
 @dataclass
@@ -49,24 +35,11 @@ class StockData:
     name: str
     history: pd.DataFrame  # daily OHLCV, DatetimeIndex
     intraday: pd.DataFrame # 5-minute bars for the latest sessions (may be empty)
-    info: dict             # fundamentals / metadata from yfinance
+    info: dict             # fundamentals / metadata from the provider
+    meta: dict = field(default_factory=dict)  # freshness / provider / quality
 
 
-def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.rename(columns=str.title)
-    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
-    df = df[keep].copy()
-    df = df.dropna(subset=["Close"])
-    # Drop timezone for clean JSON serialisation downstream.
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    return df
-
-
-def _period_to_start(period: str) -> str | None:
-    """Translate a yfinance-style period (e.g. '2y', '6mo', 'max') to a start date."""
+def _period_to_start(period: str):
     period = (period or "").strip().lower()
     if not period or period == "max":
         return None
@@ -84,99 +57,105 @@ def _period_to_start(period: str) -> str | None:
     return (datetime.now() - timedelta(days=days + 5)).strftime("%Y-%m-%d")
 
 
-def _fetch_remote_daily(ticker: str, period: str) -> pd.DataFrame:
-    df = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
-    return _clean_ohlcv(df)
+def _freshness(df: pd.DataFrame) -> dict:
+    """Describe how current a daily frame is."""
+    if df is None or df.empty:
+        return {"rows": 0, "last_date": None, "age_days": None, "stale": True}
+    last = df.index.max()
+    age = (datetime.now() - last.to_pydatetime()).days
+    return {
+        "rows": int(len(df)),
+        "last_date": last.strftime("%Y-%m-%d"),
+        "age_days": int(age),
+        "stale": age > settings.stale_after_days,
+    }
 
 
-def get_daily_history(symbol: str, exchange: str = "NSE", period: str = "2y") -> pd.DataFrame:
-    """Daily OHLCV history — local SQLite store first, Yahoo as top-up/fallback.
-
-    For NSE we keep a local 10-year archive (see ``scripts/download_history.py``).
-    We serve from there for speed/offline use, and top up the latest bars from
-    Yahoo when the stored copy is a few days stale. BSE always goes to Yahoo.
-    """
+def _load_daily(symbol: str, exchange: str, period: str) -> tuple[pd.DataFrame, dict]:
     ticker = universe.to_yahoo(symbol, exchange)
-    key = ("daily", ticker, period)
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-
     base = symbol.upper().replace(".NS", "").replace(".BO", "")
     start = _period_to_start(period)
-
-    # BSE (or any pre-suffixed BSE ticker) is not in the local store -> remote.
     use_store = exchange.upper() == "NSE" and not symbol.upper().endswith(".BO")
 
+    meta: dict = {"provider": None, "source": None, "quality": None}
     df = pd.DataFrame()
+
     if use_store:
-        stored = store.get_history(base)
+        try:
+            stored = store.get_history(base)
+        except Exception:  # noqa: BLE001
+            log.warning("store read failed for %s", base, exc_info=True)
+            stored = pd.DataFrame()
         if not stored.empty:
+            meta["source"] = "store"
             last = stored.index.max()
-            # Top up recent bars if the local copy is more than ~3 days stale.
-            if (datetime.now() - last.to_pydatetime()) > timedelta(days=3):
-                try:
-                    fresh = _fetch_remote_daily(ticker, "1mo")
-                    if not fresh.empty:
+            if (datetime.now() - last.to_pydatetime()) > timedelta(days=settings.stale_after_days):
+                fresh, fmeta = providers.get_daily(ticker, "1mo")
+                if not fresh.empty:
+                    try:
                         store.upsert_history(base, fresh)
                         stored = store.get_history(base)
-                except Exception:  # noqa: BLE001 - offline: serve what we have
-                    pass
+                        meta["source"] = "store+topup"
+                        meta["provider"] = fmeta.get("provider")
+                    except Exception:  # noqa: BLE001
+                        log.warning("store top-up failed for %s", base, exc_info=True)
             df = stored if start is None else stored[stored.index >= start]
 
     if df.empty:
-        # No local data (new symbol / BSE / empty store) -> fetch & persist.
-        df = _fetch_remote_daily(ticker, period)
+        df, fmeta = providers.get_daily(ticker, period)
+        meta["provider"] = fmeta.get("provider")
+        meta["quality"] = fmeta.get("quality")
+        meta["source"] = "provider"
         if use_store and not df.empty:
             try:
                 store.upsert_history(base, df)
             except Exception:  # noqa: BLE001
-                pass
+                log.warning("store persist failed for %s", base, exc_info=True)
 
-    _cache_set(key, df)
+    meta["freshness"] = _freshness(df)
+    return df, meta
+
+
+def get_daily_history(symbol: str, exchange: str = "NSE", period: str = "2y") -> pd.DataFrame:
+    """Daily OHLCV history (local store first, providers as top-up/fallback)."""
+    df, _ = get_daily_history_with_meta(symbol, exchange, period)
     return df
+
+
+def get_daily_history_with_meta(symbol: str, exchange: str = "NSE",
+                                period: str = "2y") -> tuple[pd.DataFrame, dict]:
+    ticker = universe.to_yahoo(symbol, exchange)
+    key = f"daily:{ticker}:{period}"
+    result = cache.get_or_compute(
+        key, settings.cache_ttl_daily,
+        lambda: _load_daily(symbol, exchange, period),
+    )
+    if result is None:
+        return pd.DataFrame(), {"provider": None, "freshness": _freshness(pd.DataFrame())}
+    return result
 
 
 def get_intraday(symbol: str, exchange: str = "NSE", period: str = "5d",
                  interval: str = "5m") -> pd.DataFrame:
     """Intraday OHLCV bars. Cached per (ticker, period, interval)."""
     ticker = universe.to_yahoo(symbol, exchange)
-    key = ("intraday", ticker, period, interval)
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    try:
-        df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
-        df = _clean_ohlcv(df)
-    except Exception:
-        df = pd.DataFrame()
-    _cache_set(key, df)
-    return df
+    key = f"intraday:{ticker}:{period}:{interval}"
+    result = cache.get_or_compute(
+        key, settings.cache_ttl_intraday,
+        lambda: providers.get_intraday(ticker, period, interval),
+    )
+    return result if result is not None else pd.DataFrame()
 
 
 def get_info(symbol: str, exchange: str = "NSE") -> dict:
     """Fundamental metadata (PE, market cap, 52w range, etc.). Best-effort."""
     ticker = universe.to_yahoo(symbol, exchange)
-    key = ("info", ticker)
-    cached = _cache_get(key)
-    if cached is not None:
-        return cached
-    info = {}
-    try:
-        raw = yf.Ticker(ticker).info or {}
-        wanted = [
-            "longName", "shortName", "sector", "industry", "currency",
-            "marketCap", "trailingPE", "forwardPE", "priceToBook",
-            "dividendYield", "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
-            "beta", "returnOnEquity", "profitMargins", "debtToEquity",
-            "earningsGrowth", "revenueGrowth", "recommendationKey",
-            "targetMeanPrice", "averageVolume",
-        ]
-        info = {k: raw.get(k) for k in wanted if raw.get(k) is not None}
-    except Exception:
-        info = {}
-    _cache_set(key, info)
-    return info
+    key = f"info:{ticker}"
+    result = cache.get_or_compute(
+        key, settings.cache_ttl_info,
+        lambda: providers.get_info(ticker),
+    )
+    return result if result is not None else {}
 
 
 def load_stock(symbol: str, exchange: str = "NSE", with_intraday: bool = True,
@@ -186,7 +165,7 @@ def load_stock(symbol: str, exchange: str = "NSE", with_intraday: bool = True,
     base = symbol.upper().replace(".NS", "").replace(".BO", "")
     name = universe.SYMBOL_TO_NAME.get(base, base)
 
-    history = get_daily_history(symbol, exchange, period=period)
+    history, meta = get_daily_history_with_meta(symbol, exchange, period=period)
     intraday = get_intraday(symbol, exchange) if with_intraday else pd.DataFrame()
     info = get_info(symbol, exchange) if with_info else {}
 
@@ -198,4 +177,5 @@ def load_stock(symbol: str, exchange: str = "NSE", with_intraday: bool = True,
         history=history,
         intraday=intraday,
         info=info,
+        meta=meta,
     )
