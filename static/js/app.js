@@ -30,6 +30,7 @@ document.querySelectorAll(".tab").forEach((t) => {
     const tab = t.dataset.tab;
     document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
     $(tab + "-view").classList.add("active");
+    if (tab === "status") loadStatus();
   });
 });
 
@@ -127,11 +128,71 @@ async function analyze() {
     const url = `/api/analyze?symbol=${encodeURIComponent(state.selected.symbol)}&exchange=${state.exchange}&model=${encodeURIComponent(state.model)}`;
     const res = await apiFetch(url);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Analysis failed");
+    if (!res.ok) {
+      // A structured "no data" response carries recovery actions we can render.
+      if (data && data.recovery) { hide("loader"); renderRecovery(data); return; }
+      throw new Error(data.error || "Analysis failed");
+    }
     renderResult(data);
     hide("loader"); show("result");
   } catch (e) {
     hide("loader"); showError(e.message);
+  }
+}
+
+// Render an actionable recovery panel when a stock has no data available.
+function renderRecovery(data) {
+  const box = $("errorBox");
+  const acts = (data.recovery && data.recovery.actions) || [];
+  const diag = data.diagnosis || {};
+  const chips = [];
+  if (diag.symbol_known === false) chips.push("unknown symbol");
+  else if (diag.ssl_issue) chips.push("SSL / certificate error");
+  else if (diag.all_providers_down) chips.push("providers unreachable");
+  if (diag.has_local_data) chips.push("stale local copy exists");
+  const chipHtml = chips.length
+    ? `<div class="rec-chips">${chips.map((c) => `<span class="rec-chip">${c}</span>`).join("")}</div>` : "";
+
+  const btns = acts.map((a) =>
+    `<button class="rec-act" data-act="${a.id}" data-sym="${a.symbol || ""}">${a.label}</button>`).join("");
+
+  box.className = "errorbox recovery";
+  box.innerHTML = `
+    <div class="rec-title">${data.error || "No data available"}</div>
+    <div class="rec-hint">${data.hint || ""}</div>
+    ${chipHtml}
+    <div class="rec-actions">${btns}</div>
+    <div id="recMsg" class="rec-msg hidden"></div>`;
+  box.classList.remove("hidden");
+
+  box.querySelectorAll(".rec-act").forEach((b) => {
+    b.addEventListener("click", () => handleRecovery(b.dataset.act, b.dataset.sym));
+  });
+}
+
+async function handleRecovery(act, sym) {
+  if (act === "retry") { analyze(); return; }
+  if (act === "status") { document.querySelector('.tab[data-tab="status"]').click(); return; }
+  if (act === "download") {
+    const msg = $("recMsg");
+    msg.className = "rec-msg"; msg.textContent = `Starting download for ${sym}…`;
+    try {
+      const res = await fetch("/api/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+        body: JSON.stringify({ symbols: [sym], force: true }),
+      });
+      if (res.status === 401) { window.location.href = "/login"; return; }
+      const d = await res.json();
+      if (d.status === "already_running") {
+        msg.textContent = "A data sync is already running — try Retry in a moment.";
+      } else {
+        msg.textContent = `Downloading ${sym} in the background. Click Retry in ~15–30s.`;
+      }
+    } catch (_) {
+      msg.className = "rec-msg err";
+      msg.textContent = "Couldn’t start the download. Check the Status page.";
+    }
   }
 }
 
@@ -639,3 +700,132 @@ function settingsMsg(text, ok) {
 function show(id) { $(id).classList.remove("hidden"); }
 function hide(id) { $(id).classList.add("hidden"); }
 function showError(msg) { const e = $("errorBox"); e.textContent = msg; e.classList.remove("hidden"); }
+
+
+// ----- Status page (Sec. 13) -----
+function statusMsg(text, ok) {
+  const el = $("statusMsg");
+  if (!el) return;
+  el.textContent = text;
+  el.className = "settings-msg " + (ok ? "ok" : "err");
+}
+
+async function loadStatus() {
+  const body = $("statusBody");
+  body.innerHTML = '<div class="settings-loading">Loading status…</div>';
+  try {
+    const res = await apiFetch("/api/status");
+    const d = await res.json();
+    renderStatus(d);
+  } catch (e) {
+    body.innerHTML = '<div class="settings-loading">Failed to load status.</div>';
+  }
+}
+
+function pill(state, kind) {
+  const good = ["ok", "closed", "reachable", "up_to_date"];
+  const bad = ["error", "open", "degraded", "unreachable"];
+  let cls = "neu";
+  if (good.includes(state)) cls = "up";
+  else if (bad.includes(state)) cls = "down";
+  return `<span class="status-pill ${cls}">${state || "—"}</span>`;
+}
+
+function renderStatus(d) {
+  const store = d.store || {};
+  const preds = d.predictions || {};
+  const sent = d.sentiment || {};
+  const sync = (d.sync || [])[0];
+  const cards = [];
+
+  // Data store card.
+  cards.push(`<div class="status-card">
+    <h3>📦 Local Data Store</h3>
+    <div class="status-kv"><span>Symbols</span><b>${store.symbols ?? "—"}</b></div>
+    <div class="status-kv"><span>Price rows</span><b>${(store.rows ?? 0).toLocaleString("en-IN")}</b></div>
+    <div class="status-kv"><span>Date range</span><b>${store.min_date || "—"} → ${store.max_date || "—"}</b></div>
+    <div class="status-kv"><span>Sentiment rows</span><b>${(sent.rows ?? 0).toLocaleString("en-IN")}</b></div>
+  </div>`);
+
+  // Sync health card.
+  cards.push(`<div class="status-card">
+    <h3>🔄 Data Synchronisation</h3>
+    <div class="status-kv"><span>Running now</span><b>${d.sync_running ? "yes" : "no"}</b></div>
+    <div class="status-kv"><span>Last run</span>${sync ? pill(sync.status) : "<b>never</b>"}</div>
+    <div class="status-kv"><span>When</span><b>${sync ? sync.updated_at : "—"}</b></div>
+    <div class="status-kv"><span>Detail</span><b class="status-detail">${sync ? (sync.detail || "") : "Run a sync to populate."}</b></div>
+  </div>`);
+
+  // Providers card.
+  const ph = d.provider_health || [];
+  const provRows = ph.length
+    ? ph.map((p) => `<div class="status-kv"><span>${p.name}</span>${pill(p.status)}</div>`).join("")
+    : Object.entries(d.providers || {}).map(([k, v]) => `<div class="status-kv"><span>${k}</span>${pill(v)}</div>`).join("");
+  cards.push(`<div class="status-card">
+    <h3>🌐 Data Providers</h3>${provRows || "<div class='status-kv'><span>none</span></div>"}
+  </div>`);
+
+  // Predictions audit card.
+  const modes = preds.by_mode || {};
+  const modeRows = Object.keys(modes).length
+    ? Object.entries(modes).map(([k, v]) => `<div class="status-kv"><span>${k}</span><b>${v}</b></div>`).join("")
+    : "<div class='status-kv'><span>none yet</span></div>";
+  cards.push(`<div class="status-card">
+    <h3>🤖 Predictions (audit)</h3>
+    <div class="status-kv"><span>Total logged</span><b>${preds.total ?? 0}</b></div>
+    <div class="status-kv"><span>Last</span><b>${preds.last_created || "—"}</b></div>
+    ${modeRows}
+  </div>`);
+
+  // News + universe card.
+  const news = d.news || {};
+  cards.push(`<div class="status-card">
+    <h3>📰 News &amp; Universe</h3>
+    <div class="status-kv"><span>News enabled</span><b>${news.enabled ? "yes" : "no"}</b></div>
+    <div class="status-kv"><span>Providers</span><b>${(news.providers || []).join(", ") || "none"}</b></div>
+    <div class="status-kv"><span>Universe</span><b>${(d.universe ?? 0).toLocaleString("en-IN")} stocks</b></div>
+    <div class="status-kv"><span>ML models</span><b>${(d.models || []).length}</b></div>
+  </div>`);
+
+  const banner = renderConnBanner(d.connectivity);
+  $("statusBody").innerHTML = banner + `<div class="status-grid">${cards.join("")}</div>`;
+}
+
+// A prominent connectivity banner (green = OK, amber/red = degraded/offline).
+function renderConnBanner(conn) {
+  if (!conn || conn.severity === "unknown") return "";
+  if (conn.severity === "ok") {
+    return `<div class="conn-banner ok">✓ Market data providers reachable</div>`;
+  }
+  const fixes = (conn.fixes || []).map((f) => `<li>${f}</li>`).join("");
+  const sev = conn.severity === "offline" ? "offline" : "degraded";
+  return `<div class="conn-banner ${sev}">
+    <div class="conn-title">⚠ ${conn.title || "Data providers unavailable"}</div>
+    <div class="conn-hint">${conn.hint || ""}</div>
+    ${fixes ? `<ul class="conn-fixes">${fixes}</ul>` : ""}
+  </div>`;
+}
+
+$("refreshStatusBtn")?.addEventListener("click", loadStatus);
+$("syncNowBtn")?.addEventListener("click", async () => {
+  const btn = $("syncNowBtn");
+  btn.disabled = true; btn.textContent = "Starting…";
+  try {
+    const res = await fetch("/api/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+      body: JSON.stringify({}),
+    });
+    if (res.status === 401) { window.location.href = "/login"; return; }
+    const d = await res.json();
+    if (d.status === "already_running") statusMsg("A sync is already running.", true);
+    else statusMsg(`Sync started (up to ${d.limit} symbols). Refresh in a moment to see progress.`, true);
+    $("statusMsg").classList.remove("hidden");
+  } catch (e) {
+    statusMsg("Failed to start sync.", false);
+    $("statusMsg").classList.remove("hidden");
+  } finally {
+    btn.disabled = false; btn.textContent = "Sync data now";
+    setTimeout(loadStatus, 2500);
+  }
+});

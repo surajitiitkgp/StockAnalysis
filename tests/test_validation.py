@@ -54,3 +54,34 @@ def test_high_low_envelope_repaired():
     out, report = validation.clean_ohlcv(df)
     row = out.iloc[15]
     assert row["High"] >= max(row["Open"], row["Close"])
+
+
+def test_expected_sessions_counts_business_days():
+    import pandas as pd
+    from analysis import validation
+    # Mon 2024-01-01 .. Fri 2024-01-05 inclusive = 5 business days.
+    assert validation.expected_sessions(pd.Timestamp("2024-01-01"),
+                                        pd.Timestamp("2024-01-05")) == 5
+
+
+def test_missing_sessions_flags_gap():
+    import numpy as np
+    import pandas as pd
+    from analysis import validation
+    # Two continuous business-day weeks with a one-week hole in the middle.
+    idx = pd.bdate_range("2024-01-01", periods=5).append(
+        pd.bdate_range("2024-01-15", periods=5))
+    df = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0,
+                       "Volume": 1.0}, index=idx)
+    rep = validation.missing_sessions(df)
+    assert rep["present"] == 10
+    assert rep["missing"] >= 5
+    assert rep["largest_gaps"]
+    assert rep["coverage_pct"] is not None
+
+
+def test_missing_sessions_empty():
+    import pandas as pd
+    from analysis import validation
+    rep = validation.missing_sessions(pd.DataFrame())
+    assert rep["present"] == 0 and rep["largest_gaps"] == []

@@ -187,3 +187,91 @@ def vix_history(period: str = "10y") -> pd.Series:
     s.index = pd.to_datetime(s.index)
     s.name = "vix"
     return s
+
+
+# --------------------------------------------------------------------------- #
+# Optional enrichment endpoints (Sec. 4 — "useful optional enrichment")
+# --------------------------------------------------------------------------- #
+# These are best-effort, read-only wrappers over additional NseIndiaApi calls.
+# They are NOT part of the core price pipeline: they enrich the UI when NSE is
+# reachable and degrade to empty results otherwise. Every one is wrapped so a
+# single failing endpoint can never crash the app (Sec. 4 requirement).
+def market_status() -> dict:
+    """Current market status (open/closed per segment). Empty dict on failure."""
+    client = _get_client()
+    if client is None:
+        return {}
+    try:
+        data = client.status()
+        segments = {}
+        for seg in (data or {}).get("marketState", []):
+            name = seg.get("market") or seg.get("index")
+            if name:
+                segments[name] = {
+                    "status": seg.get("marketStatus"),
+                    "trade_date": seg.get("tradeDate"),
+                    "last": _to_float(seg.get("last")),
+                }
+        return {"segments": segments, "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    except Exception:  # noqa: BLE001
+        log.info("NSE market status failed", exc_info=True)
+        return {}
+
+
+def corporate_actions(symbol: str) -> list[dict]:
+    """Corporate actions (dividends/splits/bonuses) for a symbol (Sec. 11)."""
+    client = _get_client()
+    if client is None:
+        return []
+    base = symbol.upper().replace(".NS", "").replace(".BO", "")
+    try:
+        data = client.actions(segment="equities", symbol=base)
+        out = []
+        for r in data or []:
+            out.append({
+                "symbol": base,
+                "subject": r.get("subject") or r.get("purpose"),
+                "ex_date": r.get("exDate") or r.get("exdate"),
+                "record_date": r.get("recDate") or r.get("recordDate"),
+            })
+        return out
+    except Exception:  # noqa: BLE001
+        log.info("NSE corporate actions failed for %s", base, exc_info=True)
+        return []
+
+
+def quote(symbol: str) -> dict:
+    """Live-ish quote snapshot for a symbol. Empty dict on failure."""
+    client = _get_client()
+    if client is None:
+        return {}
+    base = symbol.upper().replace(".NS", "").replace(".BO", "")
+    try:
+        data = client.quote(base)
+        price = (data or {}).get("priceInfo", {})
+        return {
+            "symbol": base,
+            "last_price": _to_float(price.get("lastPrice")),
+            "change": _to_float(price.get("change")),
+            "pct_change": _to_float(price.get("pChange")),
+            "open": _to_float(price.get("open")),
+            "close": _to_float((price.get("intraDayHighLow") or {}).get("value")),
+            "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    except Exception:  # noqa: BLE001
+        log.info("NSE quote failed for %s", base, exc_info=True)
+        return {}
+
+
+def health_check() -> dict:
+    """Report whether the NSE API is enabled and reachable (Sec. 4/5)."""
+    if not settings.use_nse_api:
+        return {"enabled": False, "reachable": False, "reason": "disabled"}
+    client = _get_client()
+    if client is None:
+        return {"enabled": True, "reachable": False, "reason": "unavailable"}
+    try:
+        client.status()
+        return {"enabled": True, "reachable": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": True, "reachable": False, "reason": str(exc)[:200]}

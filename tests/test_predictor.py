@@ -120,3 +120,85 @@ def test_news_overlay_adjusts_confidence(monkeypatch):
     # Positive news agreeing with a positive forecast raises confidence.
     assert per_horizon[0]["confidence"] > 50.0
     assert per_horizon[0]["news_adjusted"] is True
+
+
+# --------------------------------------------------------------------------- #
+# Graduated insufficient-history workflow (Sec. 7) + provenance (Sec. 8)
+# --------------------------------------------------------------------------- #
+def test_full_history_mode_and_freshness(monkeypatch):
+    _patch_history(monkeypatch, make_ohlcv())
+    r = predictor.predict("TESTFULL", model="random_forest", horizons=[7], use_cache=False)
+    assert r["available"]
+    assert r["prediction_mode"] == predictor.MODE_FULL
+    assert r["limited_data"] is False
+    dq = r["data_quality"]
+    for key in ("first_observation", "last_observation", "raw_observations",
+                "feature_ready_observations", "interval", "trading_sessions_old",
+                "quality", "generated_at"):
+        assert key in dq
+    assert dq["raw_observations"] == r["history_days"]
+
+
+def test_baseline_models_registered():
+    assert set(models.baseline_keys()) == {"naive", "drift"}
+    assert models.is_baseline("naive")
+    assert not models.is_baseline("random_forest")
+    assert "naive" not in models.selectable_keys()
+    assert "drift" not in models.selectable_keys()
+
+
+def test_naive_and_drift_predict():
+    X = np.zeros((5, 3))
+    naive = models.build("naive").fit(X, np.array([0.1, -0.2, 0.3, 0.0, 0.05]))
+    assert list(naive.predict(X)) == [0.0] * 5
+    drift = models.build("drift").fit(X, np.array([0.1, 0.3]))
+    assert abs(drift.predict(X)[0] - 0.2) < 1e-9
+
+
+def test_reduced_feature_fallback(monkeypatch):
+    # ~140 rows: below ml_min_rows (300) so the full tier can't validate, but
+    # well above the hard floor, so a limited-data tier should engage.
+    _patch_history(monkeypatch, make_ohlcv(n=140))
+    r = predictor.predict("TESTLOW", model="random_forest", horizons=[7], use_cache=False)
+    assert r["available"]
+    assert r["prediction_mode"] in (predictor.MODE_REDUCED, predictor.MODE_BASELINE)
+    assert r["limited_data"] is True
+    assert r["confidence"] <= predictor._MODE_CONF_CAP[r["prediction_mode"]]
+
+
+def test_refuses_below_hard_floor(monkeypatch):
+    _patch_history(monkeypatch, make_ohlcv(n=40))
+    r = predictor.predict("TESTTINY", model="random_forest", use_cache=False)
+    assert not r["available"]
+    assert r["prediction_mode"] == predictor.MODE_REFUSED
+    assert r["horizons"] == []
+
+
+def test_baseline_comparison_present(monkeypatch):
+    _patch_history(monkeypatch, make_ohlcv())
+    r = predictor.predict("TESTBM", model="random_forest", horizons=[7], use_cache=False)
+    assert r["available"]
+    h = r["horizons"][0]
+    assert "baseline_comparison" in h
+    assert "beats_baseline" in h["baseline_comparison"]
+
+
+def test_prediction_is_audited(monkeypatch):
+    _patch_history(monkeypatch, make_ohlcv())
+    from analysis import store
+    before = store.prediction_stats()["total"]
+    predictor.predict("AUDIT", model="random_forest", horizons=[1, 7], use_cache=False)
+    rows = store.recent_predictions("AUDIT")
+    assert len(rows) == 2  # one row per horizon
+    assert {r["horizon_days"] for r in rows} == {1, 7}
+    assert store.prediction_stats()["total"] == before + 2
+    assert all(r["prediction_mode"] == predictor.MODE_FULL for r in rows)
+
+
+def test_data_quality_includes_coverage(monkeypatch):
+    _patch_history(monkeypatch, make_ohlcv())
+    r = predictor.predict("COVTEST", model="random_forest", horizons=[7], use_cache=False)
+    assert r["available"]
+    cov = r["data_quality"].get("coverage")
+    assert cov is not None
+    assert "coverage_pct" in cov and "missing" in cov

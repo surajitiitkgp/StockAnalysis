@@ -26,7 +26,7 @@ import threading
 import time
 
 # Importing config first ensures the .env file is loaded before anything else.
-from analysis import news, store, universe
+from analysis import diagnostics, news, store, sync as sync_engine, universe
 from analysis.config import settings
 from analysis.logging_config import get_logger
 
@@ -89,6 +89,10 @@ def main() -> None:
     ap.add_argument("--no-warm", action="store_true", help="skip background news warm-up")
     ap.add_argument("--refresh-news", type=int, default=0, metavar="N",
                     help="fetch company news for N symbols at startup")
+    ap.add_argument("--sync-now", action="store_true",
+                    help="run an incremental data sync at startup (background)")
+    ap.add_argument("--no-scheduler", action="store_true",
+                    help="disable the daily post-close sync scheduler")
     args = ap.parse_args()
 
     log.info("Initialising store at %s", settings.db_path)
@@ -96,9 +100,35 @@ def main() -> None:
     log.info("Universe: %d symbols | cache: %s", universe.count(),
              "redis" if settings.redis_url else "in-memory")
 
+    # Boot-time provider self-check: warns loudly (with fix guidance) if every
+    # data source is unreachable — e.g. corporate SSL interception. Runs in the
+    # background so it never delays server start; result is cached for /readyz
+    # and /api/status.
+    def _provider_check():
+        try:
+            import app as _app
+            _app.PROVIDER_DIAGNOSIS = diagnostics.log_startup_check()
+        except Exception:  # noqa: BLE001
+            log.debug("provider self-check thread failed", exc_info=True)
+
+    threading.Thread(target=_provider_check, name="provider-check", daemon=True).start()
+
     if not args.no_warm:
         threading.Thread(target=_warm_news, args=(args.refresh_news,),
                          name="news-warmup", daemon=True).start()
+
+    # Optional one-off incremental sync at startup (non-blocking).
+    if args.sync_now:
+        threading.Thread(
+            target=lambda: sync_engine.sync(limit=settings.sync_limit),
+            name="startup-sync", daemon=True).start()
+
+    # Daily post-close scheduler (Sec. 2). Honours config + CLI override.
+    if settings.enable_scheduler and not args.no_scheduler:
+        threading.Thread(target=sync_engine.run_scheduler,
+                         name="sync-scheduler", daemon=True).start()
+        log.info("Daily-sync scheduler enabled (%02d:%02d local).",
+                 settings.sync_hour, settings.sync_minute)
 
     # Import here so the Flask app is created after config/store are ready.
     from app import app

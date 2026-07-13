@@ -473,3 +473,74 @@ body {
   .set-row { flex-direction: column; align-items: flex-start; gap: 8px; }
   .set-input { width: 100%; }
 }
+
+
+/* ----- Status page ----- */
+.status-body { padding: 6px 0 40px; }
+.status-grid {
+  display: grid; gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+}
+.status-card {
+  background: var(--card, #131a2b); border: 1px solid #1c2438;
+  border-radius: 12px; padding: 16px 18px;
+}
+.status-card h3 { margin: 0 0 12px; font-size: 14px; color: #cfd8ec; }
+.status-kv {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; padding: 5px 0; font-size: 13px; border-top: 1px solid #1c243822;
+}
+.status-kv span { color: #8a97b1; }
+.status-kv b { color: #e6edf7; font-weight: 600; text-align: right; }
+.status-detail { font-weight: 500 !important; font-size: 12px; color: #8a97b1 !important; }
+.status-pill {
+  padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 700;
+  background: #46506b33; color: #cfd8ec;
+}
+.status-pill.up { background: rgba(31,210,134,0.15); color: #1fd286; }
+.status-pill.down { background: rgba(255,92,122,0.15); color: #ff5c7a; }
+.status-pill.neu { background: rgba(255,182,72,0.15); color: #ffb648; }
+
+
+/* ----- Recovery panel (no-data actions) ----- */
+.errorbox.recovery {
+  text-align: left; display: block; padding: 18px 20px;
+  border: 1px solid #3a2a12; background: rgba(255,182,72,0.06);
+}
+.rec-title { font-size: 15px; font-weight: 700; color: #ffd08a; margin-bottom: 6px; }
+.rec-hint { font-size: 13px; color: #cbb79a; line-height: 1.5; margin-bottom: 12px; }
+.rec-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.rec-chip {
+  font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 999px;
+  background: rgba(255,182,72,0.14); color: #ffb648;
+}
+.rec-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.rec-act {
+  cursor: pointer;
+  border: 1px solid #46506b; background: #1a2333; color: #e6edf7;
+  padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 600;
+  transition: background .15s, border-color .15s;
+}
+.rec-act:hover { background: #22304a; border-color: #4f8cff; }
+.rec-act[data-act="download"] { background: #1f6feb22; border-color: #4f8cff; color: #9dc1ff; }
+.rec-msg { margin-top: 12px; font-size: 12.5px; color: #9dc1ff; }
+.rec-msg.err { color: #ff8fa3; }
+.rec-msg.hidden { display: none; }
+
+
+/* ----- Connectivity banner (Status page) ----- */
+.conn-banner {
+  border-radius: 12px; padding: 14px 18px; margin-bottom: 16px;
+  font-size: 13px; line-height: 1.5;
+}
+.conn-banner.ok {
+  background: rgba(31,210,134,0.10); border: 1px solid #1fd28644; color: #7ee9bd;
+  font-weight: 600;
+}
+.conn-banner.degraded { background: rgba(255,182,72,0.10); border: 1px solid #ffb64866; color: #ffd08a; }
+.conn-banner.offline { background: rgba(255,92,122,0.10); border: 1px solid #ff5c7a66; color: #ff9db0; }
+.conn-title { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+.conn-hint { color: #cbb79a; }
+.conn-banner.offline .conn-hint { color: #e0aeb8; }
+.conn-fixes { margin: 8px 0 0; padding-left: 20px; }
+.conn-fixes li { margin: 3px 0; font-family: "JetBrains Mono", monospace; font-size: 12px; }

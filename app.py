@@ -21,6 +21,7 @@ import math
 import os
 import re
 import secrets
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
@@ -40,19 +41,22 @@ from flask_cors import CORS
 from analysis import (
     auth,
     data_fetcher,
+    diagnostics,
     indicators,
     models,
     news,
     predictor,
     runtime_config,
+    nse_client,
     security,
     store,
     strategy,
+    sync as sync_engine,
     universe,
 )
 from analysis.config import settings
 from analysis.logging_config import get_logger
-from analysis.providers import breaker_status
+from analysis.providers import breaker_status, provider_health
 
 log = get_logger(__name__)
 
@@ -66,6 +70,10 @@ _VALID_EXCHANGES = {"NSE", "BSE"}
 _VALID_HORIZONS = {"intraday", "short_term", "long_term"}
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9&.\-]{1,20}$")
 CHART_DAYS = 200
+
+# Latest provider self-check result (populated by run.py at boot, refreshed by
+# the status endpoint). Lets /readyz and the UI report connectivity health.
+PROVIDER_DIAGNOSIS: dict = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -335,12 +343,23 @@ def readyz():
         db_ok = False
         db_stats = {}
     ready = db_ok
+    try:
+        sync = store.sync_health()
+    except Exception:  # noqa: BLE001
+        sync = []
+    try:
+        preds = store.prediction_stats()
+    except Exception:  # noqa: BLE001
+        preds = {}
     return (jsonify({
         "ready": ready,
         "universe": universe.count(),
         "store": db_stats,
         "providers": breaker_status(),
         "news": news.status(),
+        "sync": sync,
+        "predictions": preds,
+        "connectivity": PROVIDER_DIAGNOSIS or {"severity": "unknown"},
     }), 200 if ready else 503)
 
 
@@ -351,6 +370,135 @@ def readyz():
 @api_login_required
 def api_models():
     return jsonify({"models": models.available_models(), "horizons": list(predictor.HORIZONS)})
+
+
+@app.route("/api/status")
+@api_login_required
+def api_status():
+    """Operational status page data: data store, providers, news, sync, models."""
+    try:
+        db_stats = store.stats()
+    except Exception:  # noqa: BLE001
+        db_stats = {}
+    try:
+        sync = store.sync_health()
+    except Exception:  # noqa: BLE001
+        sync = []
+    try:
+        preds = store.prediction_stats()
+    except Exception:  # noqa: BLE001
+        preds = {}
+    try:
+        sent = store.sentiment_stats()
+    except Exception:  # noqa: BLE001
+        sent = {}
+    global PROVIDER_DIAGNOSIS
+    try:
+        PROVIDER_DIAGNOSIS = diagnostics.diagnose()
+    except Exception:  # noqa: BLE001
+        pass
+    return jsonify({
+        "store": db_stats,
+        "sentiment": sent,
+        "providers": breaker_status(),
+        "provider_health": _safe_provider_health(),
+        "connectivity": PROVIDER_DIAGNOSIS or {"severity": "unknown"},
+        "news": news.status(),
+        "sync": sync,
+        "sync_running": sync_engine.is_running(),
+        "predictions": preds,
+        "universe": universe.count(),
+        "models": [m["key"] for m in models.available_models()],
+    })
+
+
+@app.route("/api/predictions")
+@api_login_required
+def api_predictions():
+    """Recent prediction audit trail (optionally filtered by ?symbol=)."""
+    symbol = request.args.get("symbol", "").strip().upper() or None
+    if symbol and not _SYMBOL_RE.match(symbol):
+        raise ApiError("invalid symbol", 400)
+    try:
+        limit = min(200, max(1, int(request.args.get("limit", 50))))
+    except (TypeError, ValueError):
+        limit = 50
+    return jsonify({"predictions": store.recent_predictions(symbol, limit)})
+
+
+def _safe_provider_health():
+    # A live probe can be slow; guard it so the status page never hangs/500s.
+    try:
+        return provider_health()
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@app.route("/api/sync", methods=["POST"])
+@api_login_required
+def api_sync():
+    """Trigger an incremental data sync (Sec. 2). CSRF-protected, non-blocking.
+
+    Body: {"symbols": [...]?, "limit": N?, "force": bool?}. When no symbols are
+    given, syncs the most-liquid slice of the universe.
+    """
+    token = request.headers.get("X-CSRF-Token") or (request.get_json(silent=True) or {}).get("csrf_token")
+    if not security.validate_csrf(token):
+        raise ApiError("invalid or missing CSRF token", 403)
+    if sync_engine.is_running():
+        return jsonify({"status": "already_running"}), 202
+    payload = request.get_json(silent=True) or {}
+    symbols = payload.get("symbols")
+    if symbols is not None:
+        if not isinstance(symbols, list) or not all(isinstance(x, str) for x in symbols):
+            raise ApiError("symbols must be a list of strings", 400)
+        symbols = [x.strip().upper() for x in symbols if _SYMBOL_RE.match(x.strip().upper())]
+    try:
+        limit = int(payload.get("limit", settings.sync_limit))
+    except (TypeError, ValueError):
+        limit = settings.sync_limit
+    force = bool(payload.get("force", False))
+
+    # Run in a background thread so the request returns immediately.
+    def _job():
+        try:
+            sync_engine.sync(symbols=symbols, limit=limit, force=force)
+        except Exception:  # noqa: BLE001
+            log.warning("manual sync failed", exc_info=True)
+
+    threading.Thread(target=_job, name="manual-sync", daemon=True).start()
+    log.info("manual sync started by %s (limit=%s force=%s)", session.get("user"), limit, force)
+    return jsonify({"status": "started", "limit": limit, "force": force}), 202
+
+
+@app.route("/api/nse")
+@api_login_required
+def api_nse():
+    """Optional NSE enrichment (Sec. 4): market status, corporate actions, quote.
+
+    Best-effort — returns ``{"available": false}`` when NSE is unreachable or
+    disabled, never a 5xx, so one flaky endpoint can't degrade the app.
+    """
+    resource = request.args.get("resource", "status").strip().lower()
+    if not nse_client.is_enabled():
+        return jsonify({"available": False, "reason": "NSE API disabled or unavailable"})
+    try:
+        if resource == "status":
+            data = nse_client.market_status()
+        elif resource == "actions":
+            data = nse_client.corporate_actions(_req_symbol())
+        elif resource == "quote":
+            data = nse_client.quote(_req_symbol())
+        elif resource == "health":
+            data = nse_client.health_check()
+        else:
+            raise ApiError("invalid resource (status|actions|quote|health)", 400)
+    except ApiError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.info("nse enrichment %s failed: %s", resource, exc)
+        return jsonify({"available": False, "reason": "nse lookup failed"})
+    return jsonify({"available": bool(data), "resource": resource, "data": data})
 
 
 @app.route("/api/config", methods=["GET"])
@@ -394,6 +542,57 @@ def api_search():
     return jsonify(universe.search(q))
 
 
+def _diagnose_no_data(symbol: str, exchange: str) -> dict:
+    """Explain *why* there's no data and what the user can do about it.
+
+    Distinguishes a genuinely unknown symbol from a provider/network outage
+    (e.g. corporate SSL interception blocking Yahoo), and whether we have any
+    stale local copy. Returns a ``recovery`` block the UI renders as buttons.
+    """
+    base = symbol.upper().replace(".NS", "").replace(".BO", "")
+    known = base in universe.SYMBOL_TO_NAME
+    try:
+        has_local = store.row_count(base) > 0
+    except Exception:  # noqa: BLE001
+        has_local = False
+    # Single source of truth: run the shared connectivity probe, which detects
+    # SSL/proxy interception (a provider can be "closed" yet fail every call).
+    diag = diagnostics.diagnose(probe_ticker=universe.to_yahoo(base, exchange))
+    breakers = diag.get("providers") or breaker_status()
+    ssl_issue = bool(diag.get("ssl_issue"))
+    all_down = diag.get("ok") is False
+
+    actions = [{"id": "retry", "label": "Retry"},
+               {"id": "download", "label": f"Download {base} now", "symbol": base},
+               {"id": "status", "label": "Open Status page"}]
+
+    if not known:
+        title = f"\u201c{symbol}\u201d isn\u2019t in the NSE/BSE universe"
+        hint = ("Check the ticker spelling, or search by company name. If it\u2019s "
+                "a new listing, the symbol list refreshes weekly.")
+    elif all_down:
+        # Consistent, actionable guidance sourced from the diagnostics module.
+        title = diag.get("title") or "Market data providers are unreachable"
+        hint = diag.get("hint") or ""
+        if diag.get("fixes"):
+            hint = (hint + "  Fix: " + "; ".join(diag["fixes"])).strip()
+    else:
+        title = f"No price data available yet for {base}"
+        hint = ("The data providers returned nothing for this symbol right now. "
+                "Try again, or download it into the local archive so it\u2019s "
+                "available instantly next time.")
+
+    return {
+        "error": title, "reason": title, "symbol": base, "exchange": exchange,
+        "diagnosis": {
+            "symbol_known": known, "has_local_data": has_local,
+            "providers": breakers, "all_providers_down": all_down,
+            "ssl_issue": ssl_issue, "fixes": diag.get("fixes", []),
+        },
+        "hint": hint, "recovery": {"actions": actions},
+    }
+
+
 @app.route("/api/analyze")
 @api_login_required
 def api_analyze():
@@ -407,7 +606,11 @@ def api_analyze():
         raise ApiError(f"failed to fetch data: {exc}", 502)
 
     if stock.history is None or stock.history.empty:
-        raise ApiError(f"no data found for {symbol} on {exchange}", 404)
+        # Structured, actionable response so the UI can offer recovery options
+        # instead of a dead-end "no data" message.
+        payload = _diagnose_no_data(symbol, exchange)
+        status = 404 if not payload["diagnosis"]["symbol_known"] else 503
+        return jsonify(payload), status
 
     df = indicators.add_daily_indicators(stock.history)
     recommendations = strategy.analyze(stock)

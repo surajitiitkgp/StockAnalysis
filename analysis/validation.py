@@ -41,6 +41,63 @@ class QualityReport:
         }
 
 
+# Fixed NSE trading holidays are impractical to hard-code far into the future,
+# so we approximate the expected trading calendar with business days (Mon-Fri).
+# This slightly over-counts (flags exchange holidays as "missing"), so callers
+# treat the count as an upper bound / staleness signal, not a hard error.
+def expected_sessions(start, end) -> int:
+    """Approximate NSE trading sessions between two dates (inclusive), Mon-Fri."""
+    try:
+        return int(np.busday_count(pd.Timestamp(start).date(),
+                                   pd.Timestamp(end).date()) + 1)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def missing_sessions(df: pd.DataFrame, max_gap_report: int = 10) -> dict:
+    """Detect gaps in a daily OHLCV index against the business-day calendar.
+
+    Returns a summary with the expected vs. present session counts, the number
+    of missing business days, and the largest contiguous gaps (so the UI can
+    warn about suspended/illiquid instruments or provider outages). Weekend-only
+    gaps are ignored; exchange holidays may be over-counted (see module note).
+    """
+    if df is None or df.empty:
+        return {"expected": 0, "present": 0, "missing": 0, "coverage_pct": None,
+                "largest_gaps": []}
+    idx = df.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    present = len(idx)
+    exp = expected_sessions(idx.min(), idx.max())
+    full = pd.bdate_range(idx.min(), idx.max())
+    missing_days = full.difference(idx.normalize())
+    gaps = []
+    if len(missing_days):
+        # Group consecutive missing business days into runs.
+        run_start = prev = missing_days[0]
+        for d in missing_days[1:]:
+            if (d - prev).days <= 3:  # bridge weekends
+                prev = d
+                continue
+            gaps.append((run_start, prev))
+            run_start = prev = d
+        gaps.append((run_start, prev))
+        gaps.sort(key=lambda g: (g[1] - g[0]).days, reverse=True)
+    largest = [
+        {"from": a.strftime("%Y-%m-%d"), "to": b.strftime("%Y-%m-%d"),
+         "sessions": int(np.busday_count(a.date(), b.date()) + 1)}
+        for a, b in gaps[:max_gap_report]
+    ]
+    return {
+        "expected": int(exp),
+        "present": int(present),
+        "missing": int(max(0, exp - present)),
+        "coverage_pct": round(present / exp * 100, 1) if exp else None,
+        "largest_gaps": largest,
+    }
+
+
 def clean_ohlcv(df: pd.DataFrame) -> tuple[pd.DataFrame, QualityReport]:
     """Return a cleaned copy of ``df`` plus a report of what was fixed.
 

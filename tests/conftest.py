@@ -25,6 +25,13 @@ def _isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MODEL_DIR", str(tmp_path / "models"))
     monkeypatch.setenv("ML_PERSIST", "0")
 
+    # The store caches DB_PATH (read at import) and a thread-local connection,
+    # so env changes alone don't isolate tests. Point it at the temp DB and
+    # drop any cached connection so every test gets a fresh, empty database.
+    from analysis import store
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "history.db"))
+    store.reset_connection()
+
     from analysis import market, news, nse_client
     monkeypatch.setattr(news, "_active_providers", lambda: [])
     monkeypatch.setattr(news, "is_enabled", lambda: False)

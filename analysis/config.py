@@ -136,6 +136,13 @@ class Settings:
     history_years: int = field(default_factory=lambda: _env_int("HISTORY_YEARS", 10))
     # Extend short local history for a queried NSE stock from the NSE API.
     nse_augment: bool = field(default_factory=lambda: _env_bool("NSE_AUGMENT", True))
+    # Daily post-close sync schedule (local time). NSE closes 15:30 IST; the
+    # default 18:30 leaves margin for provider EOD availability. Set
+    # ``ENABLE_SCHEDULER=false`` to disable the background scheduler entirely.
+    enable_scheduler: bool = field(default_factory=lambda: _env_bool("ENABLE_SCHEDULER", True))
+    sync_hour: int = field(default_factory=lambda: _env_int("SYNC_HOUR", 18))
+    sync_minute: int = field(default_factory=lambda: _env_int("SYNC_MINUTE", 30))
+    sync_limit: int = field(default_factory=lambda: _env_int("SYNC_LIMIT", 300))
     # Feed broad-market index context + global sentiment into every stock model.
     use_market_features: bool = field(default_factory=lambda: _env_bool("USE_MARKET_FEATURES", True))
     # Include India VIX (volatility / "fear" gauge) in the market context when

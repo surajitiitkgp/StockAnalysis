@@ -79,6 +79,40 @@ The app is **local-first**: `data_fetcher` serves daily history from the store
 local copy is a few days stale. The job is resumable — symbols already up to date
 are skipped. Re-run it (e.g. daily) to keep the archive current.
 
+## Daily data synchronisation (incremental + scheduled)
+
+Beyond the one-shot bulk downloader, the app has an **incremental sync engine**
+(`analysis/sync.py`) that keeps the local archive current cheaply:
+
+- **Incremental** — only fetches bars newer than each symbol's last stored date.
+- **Idempotent** — upserts, so re-running never duplicates rows.
+- **Resilient** — reuses the retry + circuit-breaker provider chain and isolates
+  per-symbol failures (one bad symbol never aborts the run).
+- **Observable** — records a per-run health summary (`sync_health` table) shown
+  on the Status page and `/readyz`.
+
+Run it from the CLI (safe for cron):
+
+```bash
+python scripts/sync_data.py                 # sync the most-liquid slice
+python scripts/sync_data.py --limit 500     # first 500 symbols
+python scripts/sync_data.py --all           # entire universe
+python scripts/sync_data.py --symbols RELIANCE TCS INFY
+python scripts/sync_data.py --backfill TATACONSUM   # backfill one symbol
+```
+
+A **built-in scheduler** runs a post-close sync automatically (default 18:30
+local). It starts with `run.py` and is fully configurable:
+
+```bash
+python run.py --sync-now        # also run one sync at startup (background)
+python run.py --no-scheduler    # disable the daily scheduler
+```
+
+Configure via env vars: `ENABLE_SCHEDULER` (default `true`), `SYNC_HOUR` (`18`),
+`SYNC_MINUTE` (`30`), `SYNC_LIMIT` (`300`). You can also trigger a sync from the
+GUI (**Status → Sync data now**), which calls `POST /api/sync`.
+
 ## ML price forecast & verdict (multi-model, multi-horizon)
 
 `analysis/predictor.py` forecasts prices across **five horizons — 1, 2, 7, 10 and
@@ -184,7 +218,10 @@ The app is built to degrade gracefully rather than fail:
 - **Security**: scoped CORS, hardened session cookies, **login rate-limiting**,
   **API rate-limiting**, and **CSRF** protection on the auth forms.
 - **Health probes**: `GET /healthz` (liveness) and `GET /readyz` (DB + provider
-  breaker + universe readiness).
+  breaker + universe readiness + **connectivity self-check**).
+- **Provider self-check & recovery UX**: a boot-time probe detects when every
+  data source is blocked (e.g. corporate SSL interception) and logs the fix;
+  the Status page and Analyze recovery panel surface the same guidance.
 - **Tests + CI**: `pytest` suite (indicators, strategy, validation, cache,
   features, predictor, API) and a GitHub Actions workflow.
 
@@ -194,6 +231,53 @@ Run the tests with:
 pip install -r requirements.txt
 pytest -q
 ```
+
+### Troubleshooting: "no data" / SSL certificate errors
+
+If **every** stock reports *"no data"* and the logs show:
+
+```
+SSL certificate problem: unable to get local issuer certificate
+```
+
+then your network is **SSL-inspecting HTTPS** (common on corporate / managed
+Windows machines) and the data library (`yfinance` / `curl_cffi`) doesn't trust
+the proxy's root certificate — so every price fetch fails. This is an
+environment issue, not an app bug. Fixes, in order of preference:
+
+1. **Trust the OS certificate store** (recommended on Windows):
+
+   ```bash
+   pip install pip-system-certs
+   ```
+
+   This makes Python's HTTPS clients use the Windows trust store, which already
+   trusts your corporate CA. It's included in `requirements.txt` on Windows.
+
+2. **Point at your corporate root CA** explicitly:
+
+   ```powershell
+   $env:CURL_CA_BUNDLE   = "C:\path\to\corporate-root-ca.pem"
+   $env:REQUESTS_CA_BUNDLE = $env:CURL_CA_BUNDLE
+   ```
+
+3. **Seed the local archive from an un-inspected network** (e.g. a phone
+   hotspot), after which the app serves those stocks **offline**:
+
+   ```bash
+   python scripts/sync_data.py --symbols TATACONSUM TCS INFY
+   python scripts/sync_data.py --limit 300      # or the popular slice
+   ```
+
+The app helps you diagnose this itself:
+
+- On startup, a background **provider self-check** logs a clear, actionable
+  warning (with these exact fixes) when it detects every provider is blocked.
+- The **Status** tab shows a connectivity banner (green / amber / red) plus
+  per-provider health, and a **Sync data now** button.
+- When a stock has no data, the Analyze view shows a **recovery panel**
+  (Retry · Download this stock · Open Status) instead of a dead-end error, and
+  labels the cause (unknown symbol vs. providers unreachable vs. SSL error).
 
 ### Configuration (environment variables)
 
@@ -355,6 +439,10 @@ when logged out).
 | `GET /api/news?symbol=RELIANCE&exchange=NSE` / `?scope=market` | Company or market/geopolitical news + aggregate sentiment |
 | `GET /api/screener?horizon=short_term&exchange=NSE&limit=150` | Rank the most liquid stocks (`intraday` / `short_term` / `long_term`) |
 | `GET /api/config` / `POST /api/config` | Read / update GUI-editable settings (login-gated; `POST` needs CSRF, secrets masked) |
+| `GET /api/status` | Operational status: store, providers, provider health, connectivity, sync, predictions, models |
+| `POST /api/sync` | Trigger an incremental data sync (login-gated; needs CSRF) |
+| `GET /api/predictions?symbol=` | Prediction audit trail (model/data/feature/timestamp provenance) |
+| `GET /api/nse?resource=status\|actions\|quote\|health` | Optional NSE enrichment (market status, corporate actions, quote) |
 
 ## Refreshing the stock list
 

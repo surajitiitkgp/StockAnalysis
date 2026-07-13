@@ -17,6 +17,15 @@ FEATURE_COLS = [
     "range_14", "vol_ratio", "pos_52w", "dow", "month",
 ]
 
+# A reduced, low-data-friendly core used by the limited-history fallback
+# workflow. These need far less lookback than the 200-day SMA features, so a
+# usable model can still be fit when only a few months of history exist.
+CORE_FEATURE_COLS = [
+    "ret_1", "ret_2", "ret_3", "ret_5", "ret_10",
+    "px_sma_5", "px_sma_10", "px_sma_20", "rsi_14", "macd_hist",
+    "vol_10", "vol_20", "range_14", "vol_ratio", "dow", "month",
+]
+
 # Causal news-sentiment features, appended only when a sentiment series is
 # supplied. All are trailing (use only information up to the row's date).
 NEWS_FEATURE_COLS = [
@@ -162,7 +171,7 @@ def build_features(df: pd.DataFrame, sentiment_df: pd.DataFrame | None = None,
 
 
 def make_supervised(df: pd.DataFrame, horizon: int, sentiment_df: pd.DataFrame | None = None,
-                    market_df: pd.DataFrame | None = None):
+                    market_df: pd.DataFrame | None = None, base_cols: list | None = None):
     """Build (X, y, close, dates, last_valid, feature_cols) for H-day-ahead returns.
 
     ``y[i]`` is the fractional return from ``close[i]`` to ``close[i + H]`` and
@@ -172,7 +181,12 @@ def make_supervised(df: pd.DataFrame, horizon: int, sentiment_df: pd.DataFrame |
     with_news = sentiment_df is not None and not sentiment_df.empty
     with_market = market_df is not None and not market_df.empty
     market_cols = _market_columns(market_df) if with_market else None
-    cols = feature_columns(with_news, market_cols)
+    price_cols = list(base_cols) if base_cols is not None else list(FEATURE_COLS)
+    cols = list(price_cols)
+    if with_news:
+        cols += NEWS_FEATURE_COLS
+    if market_cols:
+        cols += list(market_cols)
     feats = build_features(df, sentiment_df, market_df).dropna(subset=cols + ["Close"])
     X = feats[cols].to_numpy(dtype=float)
     close = feats["Close"].to_numpy(dtype=float)

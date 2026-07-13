@@ -7,6 +7,14 @@ gunicorn
 scikit-learn>=1.3
 joblib>=1.2
 
+# On Windows/corporate networks that SSL-inspect HTTPS, yfinance/curl_cffi don't
+# trust the proxy's root CA and every price fetch fails with
+# "SSL certificate problem: unable to get local issuer certificate".
+# pip-system-certs makes Python's HTTPS clients use the OS trust store (which
+# already trusts the corporate CA), fixing this transparently. Harmless
+# elsewhere. Alternatively set CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE to a CA .pem.
+pip-system-certs>=4.0; platform_system == "Windows"
+
 # --- Optional (auto-detected at runtime) ---
 # redis>=5.0        # shared cache backend when REDIS_URL is set
 # sentry-sdk>=1.40  # error tracking when SENTRY_DSN is set

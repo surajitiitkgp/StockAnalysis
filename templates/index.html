@@ -22,6 +22,7 @@
     <nav class="tabs">
       <button class="tab active" data-tab="analyze">Analyze</button>
       <button class="tab" data-tab="screener">Screener</button>
+      <button class="tab" data-tab="status">Status</button>
     </nav>
     <div class="user-area">
       <span class="universe-badge" title="Stocks available for search">{{ stock_count }} stocks</span>
@@ -157,6 +158,17 @@
         </div>
       </div>
     </section>
+  </main>
+
+  <!-- STATUS VIEW -->
+  <main id="status-view" class="view">
+    <section class="controls">
+      <h2 style="margin:0;flex:1">System Status &amp; Data Health</h2>
+      <button id="refreshStatusBtn" class="ghost-btn">Refresh</button>
+      <button id="syncNowBtn" class="primary">Sync data now</button>
+    </section>
+    <div id="statusMsg" class="settings-msg hidden"></div>
+    <div id="statusBody" class="status-body"><div class="settings-loading">Loading status…</div></div>
   </main>
 
   <footer class="foot">Data via Yahoo Finance (NSE/BSE). Cached 15&nbsp;min. Built for educational use.</footer>

@@ -426,3 +426,32 @@ def _standardise(df: pd.DataFrame) -> pd.DataFrame:
 def breaker_status() -> dict:
     """Expose breaker state for health checks."""
     return {p.name: ("open" if p.breaker.is_open else "closed") for p in _DAILY_PROVIDERS}
+
+
+def provider_health(probe_ticker: str = "RELIANCE.NS") -> list[dict]:
+    """Lightweight per-provider health check (Sec. 5).
+
+    Returns one row per provider in the daily chain: its name, breaker state,
+    and — for providers whose breaker is closed — a live reachability probe. The
+    probe is best-effort and time-boxed by the provider timeout; a failure marks
+    the provider ``degraded`` without affecting the request path.
+    """
+    out = []
+    for p in _DAILY_PROVIDERS:
+        row = {"name": p.name,
+               "breaker": "open" if p.breaker.is_open else "closed",
+               "supports_intraday": p.supports_intraday,
+               "supports_info": p.supports_info}
+        if p.breaker.is_open:
+            row["status"] = "breaker_open"
+        else:
+            try:
+                raw = p.daily(probe_ticker, "5d")
+                df = _standardise(raw)
+                row["status"] = "ok" if df is not None and not df.empty else "empty"
+                row["rows"] = 0 if df is None else int(len(df))
+            except Exception as exc:  # noqa: BLE001
+                row["status"] = "degraded"
+                row["detail"] = str(exc)[:200]
+        out.append(row)
+    return out

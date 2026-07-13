@@ -112,6 +112,22 @@ def _load_daily(symbol: str, exchange: str, period: str) -> tuple[pd.DataFrame, 
             except Exception:  # noqa: BLE001
                 log.warning("store persist failed for %s", base, exc_info=True)
 
+    # Last-resort fallback: if every provider failed but we DO have something in
+    # the local archive (possibly stale), serve that instead of returning
+    # nothing. Stale-but-real data beats a hard "no data" error for the user.
+    if df.empty and use_store:
+        try:
+            stored = store.get_history(base)
+        except Exception:  # noqa: BLE001
+            stored = pd.DataFrame()
+        if not stored.empty:
+            log.info("serving stale local data for %s (providers unavailable)", base)
+            df = stored if start is None else stored[stored.index >= start]
+            if df.empty:
+                df = stored  # ignore the period window rather than serve nothing
+            meta["source"] = "store_stale_fallback"
+            meta["degraded"] = True
+
     meta["freshness"] = _freshness(df)
     return df, meta
 
@@ -126,10 +142,15 @@ def get_daily_history_with_meta(symbol: str, exchange: str = "NSE",
                                 period: str = "2y") -> tuple[pd.DataFrame, dict]:
     ticker = universe.to_yahoo(symbol, exchange)
     key = f"daily:{ticker}:{period}"
-    result = cache.get_or_compute(
-        key, settings.cache_ttl_daily,
-        lambda: _load_daily(symbol, exchange, period),
-    )
+    cached = cache.get(key)
+    if cached is not None and not getattr(cached[0], "empty", True):
+        return cached
+
+    result = _load_daily(symbol, exchange, period)
+    # Only cache non-empty results. Caching an empty frame after a transient
+    # provider outage would make the failure sticky for the whole TTL.
+    if result is not None and not getattr(result[0], "empty", True):
+        cache.set(key, result, settings.cache_ttl_daily)
     if result is None:
         return pd.DataFrame(), {"provider": None, "freshness": _freshness(pd.DataFrame())}
     return result

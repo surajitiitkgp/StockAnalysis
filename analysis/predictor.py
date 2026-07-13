@@ -29,7 +29,8 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import TimeSeriesSplit
 
-from . import cache, data_fetcher, features, market, models, news, store, universe
+from . import (cache, data_fetcher, features, market, models, news, store,
+               universe, validation)
 from .config import settings
 from .logging_config import get_logger
 
@@ -43,6 +44,22 @@ BUNDLE_VERSION = 4
 BACKTEST_POINTS = 10       # points shown on the predicted-vs-actual chart
 _WF_FOLDS = 4              # walk-forward folds for metrics
 _SELECT_FOLDS = 3         # (cheaper) folds used during auto model selection
+
+# Prediction reliability tiers (most -> least trustworthy). Every result is
+# tagged with one so the UI can be honest about how much to trust it.
+MODE_FULL = "full_history"
+MODE_REDUCED = "reduced_feature"
+MODE_BASELINE = "baseline"
+MODE_REFUSED = "refused"
+PREDICTION_MODES = {
+    MODE_FULL: "Full-history model",
+    MODE_REDUCED: "Reduced-feature model (limited history)",
+    MODE_BASELINE: "Short-history baseline",
+    MODE_REFUSED: "No reliable prediction",
+}
+# Confidence is capped by tier: a short-history estimate must never look as
+# trustworthy as a fully validated model.
+_MODE_CONF_CAP = {MODE_FULL: 95.0, MODE_REDUCED: 55.0, MODE_BASELINE: 35.0}
 
 
 # --------------------------------------------------------------------------- #
@@ -63,7 +80,8 @@ def _verdict(expected_return: float, horizon: int) -> str:
     return "STRONG SELL"
 
 
-def _empty(reason: str, model_key: str = models.DEFAULT_MODEL) -> dict:
+def _empty(reason: str, model_key: str = models.DEFAULT_MODEL,
+           mode: str = MODE_REFUSED, data_quality: dict | None = None) -> dict:
     return {
         "available": False,
         "reason": reason,
@@ -71,6 +89,9 @@ def _empty(reason: str, model_key: str = models.DEFAULT_MODEL) -> dict:
         "horizon_days": PRIMARY_HORIZON,
         "available_models": models.available_models(),
         "model": {"key": model_key, "label": models.label(model_key)},
+        "prediction_mode": mode,
+        "prediction_mode_label": PREDICTION_MODES.get(mode, mode),
+        "data_quality": data_quality,
         "horizons": [],
     }
 
@@ -95,13 +116,18 @@ def _metrics(actual_price, pred_price, base_price):
     }
 
 
-def _walk_forward(model_key, X, y, close, dates, last_valid, H, folds):
+def _walk_forward(model_key, X, y, close, dates, last_valid, H, folds, min_rows=None):
     """Out-of-sample evaluation via expanding-window TimeSeriesSplit(gap=H).
+
+    ``min_rows`` sets the minimum number of usable rows required before any
+    validation is attempted (defaults to half of ``ml_min_rows``). The
+    limited-history fallback tiers pass a lower floor.
 
     Returns (metrics, chart_rows) or (None, None) if there isn't enough data.
     """
     valid = np.arange(max(0, last_valid))
-    if len(valid) < max(settings.ml_min_rows // 2, folds + 2):
+    floor = settings.ml_min_rows // 2 if min_rows is None else int(min_rows)
+    if len(valid) < max(floor, folds + 2):
         return None, None
 
     Xv, yv = X[valid], y[valid]
@@ -298,6 +324,12 @@ def predict(symbol: str, exchange: str = "NSE", model: str = "auto",
     result = _predict_impl(base, symbol, exchange, model, horizons)
     if result.get("available"):
         cache.set(ckey, result, settings.ml_cache_ttl)
+        # Audit trail: persist the served forecast with its full provenance so
+        # predictions are reproducible and reviewable (Sec. 3/13). Best-effort.
+        try:
+            store.log_prediction(result)
+        except Exception:  # noqa: BLE001
+            log.debug("prediction audit log failed for %s", base, exc_info=True)
     return result
 
 
@@ -315,10 +347,116 @@ def _normalise_horizons(horizons):
     return out or list(HORIZONS)
 
 
+def _data_quality_block(df, raw_rows, feature_rows) -> dict:
+    """Provenance + freshness summary shown alongside every prediction (Sec. 8)."""
+    last = df.index.max()
+    first = df.index.min()
+    age_days = (datetime.now() - last.to_pydatetime()).days
+    # Business days between last obs and now = completed sessions of staleness.
+    sessions_old = int(np.busday_count(last.date(), datetime.now().date()))
+    try:
+        _coverage = validation.missing_sessions(df)
+    except Exception:  # noqa: BLE001
+        _coverage = None
+    if sessions_old <= 1:
+        quality = "Good"
+    elif sessions_old <= 3:
+        quality = "Fair"
+    else:
+        quality = "Stale"
+    return {
+        "first_observation": first.strftime("%Y-%m-%d"),
+        "last_observation": last.strftime("%Y-%m-%d"),
+        "raw_observations": int(raw_rows),
+        "feature_ready_observations": int(feature_rows),
+        "interval": "1d",
+        "dataset_age_days": int(age_days),
+        "trading_sessions_old": sessions_old,
+        "stale": sessions_old > settings.stale_after_days,
+        "quality": quality,
+        "coverage": _coverage,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+def _run_tier(df, horizons, sent_df, market_df, model_key, mode, base_cols,
+              wf_min_rows, valid_min_rows):
+    """Attempt to build validated forecasts for one reliability tier.
+
+    Returns (per_horizon, top_features, train_samples, feature_rows, benchmark)
+    or (None, ...) when the tier can't produce a validated forecast. Confidence
+    is capped by the tier so weaker tiers never look as trustworthy as a full
+    model.
+    """
+    per_horizon = []
+    top_features = None
+    train_samples = 0
+    feature_rows = 0
+    conf_cap = _MODE_CONF_CAP.get(mode, 95.0)
+
+    for H in sorted(horizons):
+        X, y, close, dates, last_valid, cols = features.make_supervised(
+            df, H, sent_df, market_df, base_cols=base_cols)
+        feature_rows = max(feature_rows, len(X))
+        valid_count = max(0, last_valid)
+        if valid_count < valid_min_rows:
+            continue
+
+        metrics, chart = _walk_forward(model_key, X, y, close, dates, last_valid,
+                                       H, _WF_FOLDS, min_rows=wf_min_rows)
+        if metrics is None:
+            continue
+        # Benchmark the tier's model against the naive no-change baseline so we
+        # never promote a model that fails to beat a random walk out-of-sample.
+        base_metrics, _ = _walk_forward("naive", X, y, close, dates, last_valid,
+                                        H, _WF_FOLDS, min_rows=wf_min_rows)
+
+        fwd_ret, importances = _forecast(model_key, X, y, last_valid, close, cols)
+        if importances and (top_features is None or H == PRIMARY_HORIZON):
+            top_features = [{"name": k, "importance": round(float(v), 3)}
+                            for k, v in importances]
+        train_samples = max(train_samples, valid_count)
+
+        last_price = float(close[-1])
+        target_date = dates[-1] + pd.tseries.offsets.BDay(H)
+        conf = min(conf_cap, _confidence(metrics["directional_accuracy_pct"], fwd_ret))
+        row = {
+            "days": H,
+            "verdict": _verdict(fwd_ret, H),
+            "last_price": round(last_price, 2),
+            "last_date": df.index.max().strftime("%Y-%m-%d"),
+            "forecast_price": round(last_price * (1.0 + fwd_ret), 2),
+            "forecast_date": target_date.strftime("%Y-%m-%d"),
+            "expected_return_pct": round(fwd_ret * 100, 2),
+            "confidence": conf,
+            "metrics": metrics,
+            "backtest": chart,
+        }
+        if base_metrics is not None:
+            row["baseline_comparison"] = {
+                "model": "naive",
+                "baseline_mae_pct": base_metrics["mae_pct"],
+                "beats_baseline": bool(metrics["mae_pct"] <= base_metrics["mae_pct"]),
+            }
+        per_horizon.append(row)
+
+    if not per_horizon:
+        return None, None, 0, feature_rows
+    return per_horizon, top_features, train_samples, feature_rows
+
+
 def _predict_impl(base, symbol, exchange, model, horizons) -> dict:
     df = data_fetcher.get_daily_history(symbol, exchange, period="10y")
-    if df is None or df.empty or len(df) < settings.ml_min_rows:
-        return _empty("Not enough history to train a model.", model)
+    raw_rows = 0 if df is None else len(df)
+
+    # Hard floor: below ml_abs_min_rows there is genuinely too little data for
+    # even a short-history baseline, so we refuse rather than fabricate.
+    if df is None or df.empty or raw_rows < settings.ml_abs_min_rows:
+        dq = _data_quality_block(df, raw_rows, 0) if raw_rows else None
+        return _empty(
+            f"Not enough history: only {raw_rows} observations available; a minimum "
+            f"of {settings.ml_abs_min_rows} is required for any reliable estimate.",
+            model, mode=MODE_REFUSED, data_quality=dq)
 
     last_date = df.index.max().strftime("%Y-%m-%d")
 
@@ -344,68 +482,71 @@ def _predict_impl(base, symbol, exchange, model, horizons) -> dict:
             market_df = None
     used_market_features = market_df is not None
 
-    # Determine which concrete model to use (resolve "auto").
+    # ------------------------------------------------------------------ #
+    # Resolve "auto" (only meaningful for the full-history tier).
+    # ------------------------------------------------------------------ #
     selected_from = None
     scoreboard = []
+    full_model_key = model
     if model == "auto":
-        # Selection uses whichever requested horizon is closest to the primary.
         sel_h = min(horizons, key=lambda h: abs(h - PRIMARY_HORIZON))
         Xs, ys, close_s, dates_s, lv_s, _ = features.make_supervised(df, sel_h, sent_df, market_df)
-        if len(Xs) < settings.ml_min_rows:
-            return _empty("Not enough clean history after feature construction.", model)
-        model_key, scoreboard = _select_model(Xs, ys, close_s, dates_s, lv_s, sel_h)
-        selected_from = "auto"
-    else:
-        model_key = model
+        if len(Xs) >= settings.ml_min_rows:
+            full_model_key, scoreboard = _select_model(Xs, ys, close_s, dates_s, lv_s, sel_h)
+            selected_from = "auto"
+        else:
+            full_model_key = None  # not enough for a full model; ladder handles it
 
+    # ------------------------------------------------------------------ #
+    # Disk-bundle fast path (full tier only, deterministic model key).
+    # ------------------------------------------------------------------ #
     sent_sig = _sent_signature(sent_df) + "|" + market.context_signature(market_df)
-    cached_bundle = _load_bundle(base, exchange, model_key, last_date, horizons, sent_sig)
-    if cached_bundle is not None:
-        cached_bundle = dict(cached_bundle)
-        cached_bundle.pop("_saved_at", None)
-        cached_bundle.pop("_bundle_version", None)
-        cached_bundle.pop("_sent_sig", None)
-        cached_bundle["from_cache"] = "disk"
-        return cached_bundle
+    if full_model_key:
+        cached_bundle = _load_bundle(base, exchange, full_model_key, last_date, horizons, sent_sig)
+        if cached_bundle is not None:
+            cached_bundle = dict(cached_bundle)
+            for k in ("_saved_at", "_bundle_version", "_sent_sig"):
+                cached_bundle.pop(k, None)
+            cached_bundle["from_cache"] = "disk"
+            return cached_bundle
 
-    per_horizon = []
-    top_features = None
-    train_samples = 0
-    history_days = 0
+    # ------------------------------------------------------------------ #
+    # Graduated fallback ladder (Sec. 7): full -> reduced -> baseline.
+    # Each rung uses fewer features / less history and caps confidence lower.
+    # ------------------------------------------------------------------ #
+    half = settings.ml_min_rows // 2          # ~150 default
+    lo = settings.ml_abs_min_rows // 2        # ~45 default
+    ladder = []
+    if full_model_key:
+        ladder.append((MODE_FULL, full_model_key, None, half, half))
+    # Reduced-feature tier: core features only, lighter model, lower floors.
+    reduced_key = full_model_key if (full_model_key and not models.is_baseline(full_model_key)) else "ridge"
+    ladder.append((MODE_REDUCED, reduced_key, features.CORE_FEATURE_COLS, lo, lo))
+    # Baseline tier: drift benchmark on the core window (always fits).
+    ladder.append((MODE_BASELINE, "drift", features.CORE_FEATURE_COLS, lo, lo))
 
-    for H in sorted(horizons):
-        X, y, close, dates, last_valid, cols = features.make_supervised(df, H, sent_df, market_df)
-        history_days = len(X)
-        valid_count = max(0, last_valid)
-        if valid_count < settings.ml_min_rows // 2:
-            continue
-        train_samples = max(train_samples, valid_count)
+    chosen = None
+    for mode, mkey, base_cols, wf_min, valid_min in ladder:
+        try:
+            out = _run_tier(df, horizons, sent_df, market_df, mkey, mode,
+                            base_cols, wf_min, valid_min)
+        except Exception:  # noqa: BLE001 - a tier failure must fall through, not crash
+            log.info("prediction tier %s failed for %s", mode, base, exc_info=True)
+            out = (None, None, 0, 0)
+        per_horizon, top_features, train_samples, feature_rows = out
+        if per_horizon:
+            chosen = (mode, mkey, per_horizon, top_features, train_samples, feature_rows)
+            break
 
-        metrics, chart = _walk_forward(model_key, X, y, close, dates, last_valid, H, _WF_FOLDS)
-        if metrics is None:
-            continue
-        fwd_ret, importances = _forecast(model_key, X, y, last_valid, close, cols)
-        if importances and (top_features is None or H == PRIMARY_HORIZON):
-            top_features = [{"name": k, "importance": round(float(v), 3)} for k, v in importances]
+    if chosen is None:
+        dq = _data_quality_block(df, raw_rows, 0)
+        return _empty(
+            "Insufficient clean, validated history to produce a reliable forecast "
+            "even with a short-history baseline.",
+            full_model_key or model, mode=MODE_REFUSED, data_quality=dq)
 
-        last_price = float(close[-1])
-        forecast_price = last_price * (1.0 + fwd_ret)
-        target_date = dates[-1] + pd.tseries.offsets.BDay(H)
-        per_horizon.append({
-            "days": H,
-            "verdict": _verdict(fwd_ret, H),
-            "last_price": round(last_price, 2),
-            "last_date": last_date,
-            "forecast_price": round(forecast_price, 2),
-            "forecast_date": target_date.strftime("%Y-%m-%d"),
-            "expected_return_pct": round(fwd_ret * 100, 2),
-            "confidence": _confidence(metrics["directional_accuracy_pct"], fwd_ret),
-            "metrics": metrics,
-            "backtest": chart,
-        })
-
-    if not per_horizon:
-        return _empty("Not enough data to validate any horizon.", model_key)
+    mode, model_key, per_horizon, top_features, train_samples, feature_rows = chosen
+    data_quality = _data_quality_block(df, raw_rows, feature_rows)
 
     # Real-time news/sentiment overlay (fetch + persist to the archive).
     news_block = _news_overlay(base, exchange, per_horizon)
@@ -416,17 +557,22 @@ def _predict_impl(base, symbol, exchange, model, horizons) -> dict:
         "available": True,
         "symbol": base,
         "exchange": exchange.upper(),
+        "prediction_mode": mode,
+        "prediction_mode_label": PREDICTION_MODES.get(mode, mode),
+        "limited_data": mode != MODE_FULL,
         "model": {
             "key": model_key,
             "label": models.label(model_key),
-            "selected_from": selected_from,
-            "scoreboard": scoreboard,
+            "selected_from": selected_from if mode == MODE_FULL else None,
+            "scoreboard": scoreboard if mode == MODE_FULL else [],
+            "is_baseline": models.is_baseline(model_key),
         },
         "available_models": models.available_models(),
         "trained_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "last_date": last_date,
-        "history_days": int(history_days),
+        "history_days": int(raw_rows),
         "train_samples": int(train_samples),
+        "data_quality": data_quality,
         "top_features": top_features or [],
         "news_features_used": used_news_features,
         "market_features_used": used_market_features,
@@ -444,5 +590,8 @@ def _predict_impl(base, symbol, exchange, model, horizons) -> dict:
         "backtest": primary["backtest"],
     }
 
-    _save_bundle(base, exchange, model_key, result, sent_sig)
+    # Only persist fully validated, full-history models to disk. Weaker tiers
+    # are cheap to recompute and we don't want stale low-confidence bundles.
+    if mode == MODE_FULL:
+        _save_bundle(base, exchange, model_key, result, sent_sig)
     return result
