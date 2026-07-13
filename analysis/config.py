@@ -108,6 +108,10 @@ class Settings:
     # Optional extra price providers (used as fallbacks only when a key is set).
     twelvedata_api_key: str | None = field(default_factory=lambda: os.environ.get("TWELVEDATA_API_KEY"))
     alphavantage_api_key: str | None = field(default_factory=lambda: os.environ.get("ALPHAVANTAGE_API_KEY"))
+    # Stooq is excluded from the (India-focused) provider chain by default: its
+    # NSE/BSE coverage is poor/unreliable and its free endpoint now serves a
+    # bot challenge. Set ``USE_STOOQ=true`` to re-enable it as a last resort.
+    use_stooq: bool = field(default_factory=lambda: _env_bool("USE_STOOQ", False))
     # Unofficial NSE India API (bennythadikaran/NseIndiaApi): direct-from-source
     # equity history + India VIX. Key-less but scrapes NSE, so it's opt-out and
     # degrades gracefully (NSE blocks many non-Indian / cloud IPs).
@@ -143,6 +147,17 @@ class Settings:
     sync_hour: int = field(default_factory=lambda: _env_int("SYNC_HOUR", 18))
     sync_minute: int = field(default_factory=lambda: _env_int("SYNC_MINUTE", 30))
     sync_limit: int = field(default_factory=lambda: _env_int("SYNC_LIMIT", 300))
+    # Intraday auto-refresh: while the market is open, sync prices every N
+    # minutes so quotes stay near-live without manual clicks. 0/false disables.
+    # Bounded to the most-liquid slice (``intraday_sync_limit``) to stay light
+    # and provider-friendly. Market hours below are IST (NSE 09:15-15:30 Mon-Fri).
+    enable_intraday_sync: bool = field(default_factory=lambda: _env_bool("ENABLE_INTRADAY_SYNC", True))
+    intraday_sync_minutes: int = field(default_factory=lambda: _env_int("INTRADAY_SYNC_MINUTES", 15))
+    intraday_sync_limit: int = field(default_factory=lambda: _env_int("INTRADAY_SYNC_LIMIT", 60))
+    market_open_hour: int = field(default_factory=lambda: _env_int("MARKET_OPEN_HOUR", 9))
+    market_open_minute: int = field(default_factory=lambda: _env_int("MARKET_OPEN_MINUTE", 15))
+    market_close_hour: int = field(default_factory=lambda: _env_int("MARKET_CLOSE_HOUR", 15))
+    market_close_minute: int = field(default_factory=lambda: _env_int("MARKET_CLOSE_MINUTE", 30))
     # Feed broad-market index context + global sentiment into every stock model.
     use_market_features: bool = field(default_factory=lambda: _env_bool("USE_MARKET_FEATURES", True))
     # Include India VIX (volatility / "fear" gauge) in the market context when

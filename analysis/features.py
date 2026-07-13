@@ -60,6 +60,46 @@ def feature_columns(with_news: bool, market_cols: list | None = None) -> list:
     return cols
 
 
+# --------------------------------------------------------------------------- #
+# Signal-group taxonomy (used by the Multi-Source Fusion model)
+# --------------------------------------------------------------------------- #
+# Every feature belongs to exactly one economic "signal source". The fusion
+# model trains a specialist per group and blends them, then attributes the
+# forecast back to these groups so we can say *how much* of a prediction comes
+# from price action vs. company news vs. geopolitics/macro.
+GROUP_PRICE = "price"
+GROUP_NEWS = "news"
+GROUP_GEO = "geopolitics"
+
+# Geopolitics/macro = broad-market sentiment + India VIX (the "fear gauge") plus
+# index dynamics / relative strength.
+_GEO_MARKET_COLS = frozenset(_SENT_MARKET_COLS) | frozenset(_VIX_COLS)
+
+
+def feature_group(col: str) -> str:
+    """Classify a single feature column into its signal group."""
+    if col in NEWS_FEATURE_COLS:
+        return GROUP_NEWS
+    if col in _GEO_MARKET_COLS:
+        return GROUP_GEO
+    if col.startswith("mkt_") or col == "rel_strength_20":
+        # Index dynamics / relative strength are macro context => geopolitics.
+        return GROUP_GEO
+    return GROUP_PRICE
+
+
+def group_indices(cols: list) -> dict:
+    """Map each signal group to the column indices it owns in ``cols``.
+
+    Groups with no columns are omitted, so the fusion model only builds
+    specialists for signal sources that are actually present.
+    """
+    groups = {}
+    for i, c in enumerate(cols):
+        groups.setdefault(feature_group(c), []).append(i)
+    return groups
+
+
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()

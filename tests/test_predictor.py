@@ -202,3 +202,94 @@ def test_data_quality_includes_coverage(monkeypatch):
     cov = r["data_quality"].get("coverage")
     assert cov is not None
     assert "coverage_pct" in cov and "missing" in cov
+
+
+# --------------------------------------------------------------------------- #
+# Multi-Source Fusion model: specialists + leak-free blend + attribution + bands
+# --------------------------------------------------------------------------- #
+def test_fusion_model_registered():
+    keys = [m["key"] for m in models.available_models()]
+    assert "fusion" in keys
+    assert "fusion" in models.selectable_keys()
+    assert not models.is_baseline("fusion")
+
+
+def test_fusion_regressor_fits_and_attributes():
+    import numpy as np
+    from analysis import features
+
+    rng = np.random.default_rng(0)
+    n = 260
+    # 3 price cols carry the real signal; news/geo cols are noise.
+    price = rng.normal(0, 1, (n, 3))
+    news = rng.normal(0, 1, (n, 2))
+    geo = rng.normal(0, 1, (n, 2))
+    X = np.column_stack([price, news, geo])
+    y = 0.6 * price[:, 0] + 0.3 * price[:, 1] + rng.normal(0, 0.1, n)
+    group_map = {"price": [0, 1, 2], "news": [3, 4], "geopolitics": [5, 6]}
+
+    fr = models.build_fusion(group_map, gap=1).fit(X, y)
+    assert set(fr.group_weights_) == {"price", "news", "geopolitics"}
+    # Weights are a valid non-negative distribution.
+    assert abs(sum(fr.group_weights_.values()) - 1.0) < 1e-6
+    assert all(w >= 0 for w in fr.group_weights_.values())
+    # Price should dominate since it carries the true signal.
+    assert fr.group_weights_["price"] >= fr.group_weights_["news"]
+    assert fr.group_weights_["price"] >= fr.group_weights_["geopolitics"]
+    # Attribution keys match the groups and are finite.
+    attr = fr.attribution(X)
+    assert set(attr) == {"price", "news", "geopolitics"}
+    assert all(np.isfinite(v) for v in attr.values())
+
+
+def test_fusion_single_group_degrades_gracefully():
+    import numpy as np
+    rng = np.random.default_rng(1)
+    X = rng.normal(0, 1, (120, 4))
+    y = X[:, 0] + rng.normal(0, 0.1, 120)
+    # No group map => treated as one "price" group; must still fit & predict.
+    fr = models.FusionRegressor().fit(X, y)
+    preds = fr.predict(X[:5])
+    assert preds.shape == (5,)
+    assert np.all(np.isfinite(preds))
+
+
+def test_quantile_bands_are_monotone():
+    import numpy as np
+    rng = np.random.default_rng(2)
+    X = rng.normal(0, 1, (200, 3))
+    y = X[:, 0] * 0.5 + rng.normal(0, 0.2, 200)
+    qb = models.QuantileBands().fit(X, y)
+    b = qb.predict_bands(X[:10])
+    assert np.all(b["p10"] <= b["p50"] + 1e-9)
+    assert np.all(b["p50"] <= b["p90"] + 1e-9)
+
+
+def test_predict_with_fusion_emits_band_and_attribution(monkeypatch):
+    import numpy as np
+    import pandas as pd
+
+    df = make_ohlcv()
+    _patch_history(monkeypatch, df)
+    idx = df.index
+    sent = pd.DataFrame({"sentiment": np.linspace(-0.2, 0.2, len(idx)),
+                         "article_count": 5}, index=idx)
+    monkeypatch.setattr(predictor.store, "get_sentiment", lambda *a, **k: sent)
+    ctx = pd.DataFrame({
+        "mkt_ret_1": np.random.default_rng(3).normal(0, 0.01, len(df)),
+        "mkt_ret_5": 0.0, "mkt_ret_20": 0.01, "mkt_vol_20": 0.012,
+        "mkt_sent_1d": 0.1, "mkt_sent_7d": 0.05,
+    }, index=df.index)
+    monkeypatch.setattr(predictor.market, "get_market_context", lambda *a, **k: ctx)
+    monkeypatch.setattr(predictor.news, "is_enabled", lambda: False)
+
+    r = predictor.predict("FUSE", model="fusion", horizons=[7], use_cache=False)
+    assert r["available"]
+    assert r["model"]["key"] == "fusion"
+    h = r["horizons"][0]
+    band = h.get("forecast_band")
+    assert band is not None
+    assert band["p10_price"] <= band["p50_price"] <= band["p90_price"]
+    sources = h["signal_attribution"]["sources"]
+    assert {s["source"] for s in sources} == {"price", "news", "geopolitics"}
+    assert abs(sum(s["share_pct"] for s in sources) - 100.0) < 1.5

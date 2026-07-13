@@ -160,6 +160,52 @@ def _seconds_until_next_run(hour: int, minute: int) -> float:
     return (target - now).total_seconds()
 
 
+def is_market_open(now: datetime | None = None) -> bool:
+    """True if the NSE cash market is open right now (Mon-Fri, 09:15-15:30 IST).
+
+    Assumes the host clock is IST (the app targets Indian markets). The window
+    is configurable via ``MARKET_OPEN_*`` / ``MARKET_CLOSE_*`` settings.
+    """
+    now = now or datetime.now()
+    if now.weekday() >= 5:  # 5=Sat, 6=Sun
+        return False
+    open_t = now.replace(hour=settings.market_open_hour,
+                         minute=settings.market_open_minute, second=0, microsecond=0)
+    close_t = now.replace(hour=settings.market_close_hour,
+                          minute=settings.market_close_minute, second=0, microsecond=0)
+    return open_t <= now <= close_t
+
+
+def run_intraday_scheduler(stop_event: threading.Event | None = None) -> None:
+    """Keep prices near-live during market hours (background thread).
+
+    While the market is open it runs a light incremental sync of the most-liquid
+    slice every ``intraday_sync_minutes`` minutes. Outside market hours it sleeps
+    efficiently until the next open, so it costs nothing overnight/weekends and
+    stays provider-friendly. Honours a stop event for clean shutdown.
+    """
+    every = max(1, settings.intraday_sync_minutes)
+    limit = settings.intraday_sync_limit or settings.sync_limit
+    log.info("intraday-sync scheduler armed: every %d min during market hours "
+             "(%02d:%02d-%02d:%02d, top %d symbols)", every,
+             settings.market_open_hour, settings.market_open_minute,
+             settings.market_close_hour, settings.market_close_minute, limit)
+    while not (stop_event and stop_event.is_set()):
+        if is_market_open():
+            try:
+                sync(limit=limit)
+            except Exception:  # noqa: BLE001
+                log.warning("intraday sync failed", exc_info=True)
+            wait = every * 60
+        else:
+            # Closed: nap in short chunks so shutdown/open is picked up promptly.
+            wait = 300
+        while wait > 0 and not (stop_event and stop_event.is_set()):
+            chunk = min(wait, 60)
+            time.sleep(chunk)
+            wait -= chunk
+
+
 def run_scheduler(stop_event: threading.Event | None = None) -> None:
     """Daily post-close scheduler loop (Sec. 2). Runs in a background thread.
 

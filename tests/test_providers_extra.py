@@ -87,3 +87,74 @@ def test_alphavantage_rate_limit_note_raises(monkeypatch):
         assert False, "expected ProviderError"
     except providers.ProviderError:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# Stooq bot-challenge detection + fallback health severity
+# --------------------------------------------------------------------------- #
+class _FakeTextResp:
+    def __init__(self, text: str):
+        self._d = text.encode()
+
+    def read(self):
+        return self._d
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _patch_text(monkeypatch, text: str):
+    monkeypatch.setattr(providers.urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeTextResp(text))
+
+
+def test_stooq_valid_csv(monkeypatch):
+    csv = "Date,Open,High,Low,Close,Volume\n2026-07-10,100,102,99,101,1000\n"
+    _patch_text(monkeypatch, csv)
+    df = providers.StooqProvider().daily("RELIANCE.NS", "2y")
+    assert len(df) == 1
+    assert df["Close"].iloc[-1] == 101
+
+
+def test_stooq_bot_challenge_detected(monkeypatch):
+    html = ('<!DOCTYPE html><html><head></head><body><noscript>'
+            'This site requires JavaScript to verify your browser.</noscript></body></html>')
+    _patch_text(monkeypatch, html)
+    try:
+        providers.StooqProvider().daily("RELIANCE.NS", "2y")
+        assert False, "expected ProviderError"
+    except providers.ProviderError as exc:
+        assert "challenge" in str(exc).lower()
+
+
+def test_stooq_empty_body_raises(monkeypatch):
+    _patch_text(monkeypatch, "")
+    try:
+        providers.StooqProvider().daily("RELIANCE.NS", "2y")
+        assert False, "expected ProviderError"
+    except providers.ProviderError as exc:
+        assert "no usable data" in str(exc).lower()
+
+
+def test_stooq_is_optional_fallback():
+    assert providers.StooqProvider().optional is True
+    assert providers.YahooProvider().optional is False
+
+
+def test_provider_health_optional_failure_is_limited(monkeypatch):
+    # An optional provider that raises should be reported "limited", not "degraded".
+    def boom(self, ticker, period):
+        raise providers.ProviderError("stooq blocked request (bot/JS challenge)")
+    monkeypatch.setattr(providers.StooqProvider, "daily", boom)
+    monkeypatch.setattr(providers.YahooProvider, "daily",
+                        lambda self, t, p: __import__("pandas").DataFrame(
+                            {"Open": [1], "High": [1], "Low": [1], "Close": [1], "Volume": [1]},
+                            index=__import__("pandas").to_datetime(["2026-07-10"])))
+    rows = {r["name"]: r for r in providers.provider_health("RELIANCE.NS")}
+    assert rows["yahoo"]["status"] == "ok"
+    if "stooq" in rows:
+        assert rows["stooq"]["status"] == "limited"
+        assert rows["stooq"]["optional"] is True

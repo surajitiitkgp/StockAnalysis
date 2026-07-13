@@ -5,7 +5,8 @@ swallowed every error, so any transient blip returned empty data and looked
 like "no data for this stock". This module fixes that:
 
   - a small ``DataProvider`` interface (daily / intraday / info),
-  - a ``YahooProvider`` (primary) and a ``StooqProvider`` (daily fallback),
+  - a ``YahooProvider`` (primary) plus optional India fallbacks (NSE India,
+    Twelve Data, Alpha Vantage; Stooq only when ``USE_STOOQ=true``),
   - ``retry_with_backoff`` for transient failures,
   - a per-provider ``CircuitBreaker`` so a dead upstream fails fast instead of
     blocking every request for the full timeout.
@@ -118,6 +119,10 @@ class DataProvider:
     name = "base"
     supports_intraday = False
     supports_info = False
+    # Optional providers are fallbacks: their failure is non-critical because a
+    # healthy primary already satisfies every request. Used by provider_health()
+    # to report a soft "limited" state instead of an alarming "degraded" one.
+    optional = False
 
     def __init__(self):
         self.breaker = CircuitBreaker(
@@ -160,6 +165,7 @@ class StooqProvider(DataProvider):
     """
 
     name = "stooq"
+    optional = True
     _URL = "https://stooq.com/q/d/l/?s={sym}&i=d"
 
     def _stooq_symbol(self, ticker: str) -> str:
@@ -176,7 +182,16 @@ class StooqProvider(DataProvider):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=settings.fetch_timeout) as resp:
             text = resp.read().decode("utf-8", errors="replace")
-        if not text or "Date" not in text.splitlines()[0]:
+        first = text.splitlines()[0] if text else ""
+        # Stooq's free CSV endpoint sometimes returns an anti-bot HTML challenge
+        # ("This site requires JavaScript to verify your browser") instead of
+        # data. A no-JS client can't pass it, so surface a precise message
+        # rather than a vague "no data" so the Status page is actionable.
+        low = text.lower()
+        if ("<html" in low or "<!doctype" in low
+                or "requires javascript" in low or "enable javascript" in low):
+            raise ProviderError("stooq blocked request (bot/JS challenge)")
+        if not text or "Date" not in first:
             raise ProviderError("stooq returned no usable data")
         df = pd.read_csv(io.StringIO(text))
         df["Date"] = pd.to_datetime(df["Date"])
@@ -192,6 +207,7 @@ class TwelveDataProvider(DataProvider):
     """
 
     name = "twelvedata"
+    optional = True
 
     def __init__(self, api_key: str):
         super().__init__()
@@ -213,8 +229,21 @@ class TwelveDataProvider(DataProvider):
             params["exchange"] = exchange
         url = "https://api.twelvedata.com/time_series?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=settings.fetch_timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        try:
+            with urllib.request.urlopen(req, timeout=settings.fetch_timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            # Read the JSON error body so plan-gating (common for Indian
+            # exchanges on the free tier) becomes a clear message.
+            try:
+                data = json.loads(exc.read().decode("utf-8", errors="replace"))
+            except Exception:  # noqa: BLE001
+                raise ProviderError(f"twelvedata: HTTP {exc.code}") from None
+        msg = str(data.get("message", ""))
+        if "Grow or Venture plan" in msg or "upgrading" in msg.lower():
+            raise ProviderError(
+                "twelvedata: Indian (NSE/BSE) symbols need a paid Grow/Venture "
+                "plan; not available on the free tier")
         if data.get("status") == "error" or "values" not in data:
             raise ProviderError(f"twelvedata: {data.get('message', 'no values')}")
         rows = data["values"]
@@ -235,6 +264,7 @@ class AlphaVantageProvider(DataProvider):
     """
 
     name = "alphavantage"
+    optional = True
 
     def __init__(self, api_key: str):
         super().__init__()
@@ -284,6 +314,7 @@ class NseProvider(DataProvider):
     """
 
     name = "nse"
+    optional = True
 
     def daily(self, ticker: str, period: str) -> pd.DataFrame:
         t = ticker.upper()
@@ -297,14 +328,22 @@ class NseProvider(DataProvider):
 
 
 def _build_daily_providers() -> list:
-    """Yahoo + Stooq always; extra providers appended when enabled."""
-    chain: list[DataProvider] = [_YAHOO, _STOOQ]
+    """Build the daily-provider chain for the Indian market.
+
+    Order: Yahoo (primary) -> NSE India (direct-from-source) -> Twelve Data ->
+    Alpha Vantage. Stooq is **excluded by default** because its NSE/BSE coverage
+    is poor/unreliable (and its free endpoint now serves a bot challenge); set
+    ``USE_STOOQ=true`` to re-enable it as a last-resort fallback.
+    """
+    chain: list[DataProvider] = [_YAHOO]
+    if settings.use_nse_api:
+        chain.append(NseProvider())
     if settings.twelvedata_api_key:
         chain.append(TwelveDataProvider(settings.twelvedata_api_key))
     if settings.alphavantage_api_key:
         chain.append(AlphaVantageProvider(settings.alphavantage_api_key))
-    if settings.use_nse_api:
-        chain.append(NseProvider())
+    if getattr(settings, "use_stooq", False):
+        chain.append(_STOOQ)
     return chain
 
 
@@ -440,6 +479,7 @@ def provider_health(probe_ticker: str = "RELIANCE.NS") -> list[dict]:
     for p in _DAILY_PROVIDERS:
         row = {"name": p.name,
                "breaker": "open" if p.breaker.is_open else "closed",
+               "optional": bool(p.optional),
                "supports_intraday": p.supports_intraday,
                "supports_info": p.supports_info}
         if p.breaker.is_open:
@@ -451,7 +491,10 @@ def provider_health(probe_ticker: str = "RELIANCE.NS") -> list[dict]:
                 row["status"] = "ok" if df is not None and not df.empty else "empty"
                 row["rows"] = 0 if df is None else int(len(df))
             except Exception as exc:  # noqa: BLE001
-                row["status"] = "degraded"
+                # A failing *optional* fallback is non-critical when a primary
+                # still works, so report the softer "limited" instead of the
+                # alarming "degraded" (which is reserved for the primary chain).
+                row["status"] = "limited" if p.optional else "degraded"
                 row["detail"] = str(exc)[:200]
         out.append(row)
     return out

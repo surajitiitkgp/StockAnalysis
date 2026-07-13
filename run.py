@@ -93,6 +93,8 @@ def main() -> None:
                     help="run an incremental data sync at startup (background)")
     ap.add_argument("--no-scheduler", action="store_true",
                     help="disable the daily post-close sync scheduler")
+    ap.add_argument("--no-intraday", action="store_true",
+                    help="disable the intraday (market-hours) price auto-refresh")
     args = ap.parse_args()
 
     log.info("Initialising store at %s", settings.db_path)
@@ -129,6 +131,15 @@ def main() -> None:
                          name="sync-scheduler", daemon=True).start()
         log.info("Daily-sync scheduler enabled (%02d:%02d local).",
                  settings.sync_hour, settings.sync_minute)
+
+    # Intraday auto-refresh: keep prices near-live during market hours (Sec. 2).
+    if settings.enable_intraday_sync and not args.no_intraday:
+        threading.Thread(target=sync_engine.run_intraday_scheduler,
+                         name="intraday-sync-scheduler", daemon=True).start()
+        log.info("Intraday price auto-refresh enabled (every %d min, %02d:%02d-%02d:%02d).",
+                 settings.intraday_sync_minutes,
+                 settings.market_open_hour, settings.market_open_minute,
+                 settings.market_close_hour, settings.market_close_minute)
 
     # Import here so the Flask app is created after config/store are ready.
     from app import app

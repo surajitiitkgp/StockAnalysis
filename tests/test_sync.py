@@ -87,3 +87,32 @@ def test_sync_isolates_failures(monkeypatch):
 def test_incremental_period_scales_with_gap():
     # Brand-new symbol -> full history window.
     assert sync._incremental_period("NEVERSEEN").endswith("y")
+
+
+# --------------------------------------------------------------------------- #
+# Intraday market-hours gating for the price auto-refresh scheduler.
+# --------------------------------------------------------------------------- #
+def test_is_market_open_weekday_hours():
+    from datetime import datetime
+    from analysis import sync
+    # Wednesday 2026-07-15 at 11:00 IST -> open.
+    assert sync.is_market_open(datetime(2026, 7, 15, 11, 0)) is True
+    # Before open (09:00) and after close (16:00) -> closed.
+    assert sync.is_market_open(datetime(2026, 7, 15, 9, 0)) is False
+    assert sync.is_market_open(datetime(2026, 7, 15, 16, 0)) is False
+
+
+def test_is_market_open_weekend():
+    from datetime import datetime
+    from analysis import sync
+    # Saturday / Sunday are always closed, even midday.
+    assert sync.is_market_open(datetime(2026, 7, 18, 11, 0)) is False
+    assert sync.is_market_open(datetime(2026, 7, 19, 11, 0)) is False
+
+
+def test_is_market_open_boundaries():
+    from datetime import datetime
+    from analysis import sync
+    # Exactly at open (09:15) and close (15:30) count as open (inclusive).
+    assert sync.is_market_open(datetime(2026, 7, 15, 9, 15)) is True
+    assert sync.is_market_open(datetime(2026, 7, 15, 15, 30)) is True

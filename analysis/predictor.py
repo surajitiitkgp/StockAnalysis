@@ -40,7 +40,7 @@ HORIZONS = (1, 2, 7, 10, 30)
 PRIMARY_HORIZON = 7
 # Bump whenever the result/bundle schema changes so stale disk bundles are
 # ignored instead of served with a mismatched shape.
-BUNDLE_VERSION = 4
+BUNDLE_VERSION = 5
 BACKTEST_POINTS = 10       # points shown on the predicted-vs-actual chart
 _WF_FOLDS = 4              # walk-forward folds for metrics
 _SELECT_FOLDS = 3         # (cheaper) folds used during auto model selection
@@ -116,7 +116,19 @@ def _metrics(actual_price, pred_price, base_price):
     }
 
 
-def _walk_forward(model_key, X, y, close, dates, last_valid, H, folds, min_rows=None):
+def _make_model(model_key, H, cols=None):
+    """Instantiate a model, binding the fusion model to its signal-group map.
+
+    The FusionRegressor needs to know which feature columns belong to price vs.
+    news vs. geopolitics; we compute that from ``cols`` and pass the horizon as
+    the leakage gap so its internal out-of-fold blend stays honest.
+    """
+    if model_key == "fusion" and cols:
+        return models.build_fusion(features.group_indices(cols), gap=H)
+    return models.build(model_key)
+
+
+def _walk_forward(model_key, X, y, close, dates, last_valid, H, folds, min_rows=None, cols=None):
     """Out-of-sample evaluation via expanding-window TimeSeriesSplit(gap=H).
 
     ``min_rows`` sets the minimum number of usable rows required before any
@@ -141,7 +153,7 @@ def _walk_forward(model_key, X, y, close, dates, last_valid, H, folds, min_rows=
     for tr, te in tscv.split(valid):
         if len(tr) < 30:
             continue
-        model = models.build(model_key)
+        model = _make_model(model_key, H, cols)
         model.fit(Xv[tr], yv[tr])
         preds = model.predict(Xv[te])
         for j, pos in enumerate(te):
@@ -165,11 +177,12 @@ def _walk_forward(model_key, X, y, close, dates, last_valid, H, folds, min_rows=
     return metrics, chart
 
 
-def _select_model(X, y, close, dates, last_valid, H) -> tuple[str, list]:
+def _select_model(X, y, close, dates, last_valid, H, cols=None) -> tuple[str, list]:
     """Pick the best base model for horizon H via walk-forward directional acc."""
     scoreboard = []
     for key in models.selectable_keys():
-        metrics, _ = _walk_forward(key, X, y, close, dates, last_valid, H, _SELECT_FOLDS)
+        metrics, _ = _walk_forward(key, X, y, close, dates, last_valid, H,
+                                   _SELECT_FOLDS, cols=cols)
         if metrics is None:
             continue
         scoreboard.append({
@@ -184,19 +197,67 @@ def _select_model(X, y, close, dates, last_valid, H) -> tuple[str, list]:
     return scoreboard[0]["model"], scoreboard
 
 
-def _forecast(model_key, X, y, last_valid, close, feature_cols):
-    """Retrain on all valid rows and predict the H-ahead return from today."""
+def _forecast(model_key, X, y, last_valid, close, feature_cols, H=PRIMARY_HORIZON):
+    """Retrain on all valid rows and predict the H-ahead return from today.
+
+    Returns ``(fwd_ret, importances, extras)`` where ``extras`` may carry the
+    fusion model's signal attribution and a probabilistic P10/P50/P90 band.
+    """
     valid = np.arange(max(0, last_valid))
-    model = models.build(model_key)
+    model = _make_model(model_key, H, feature_cols)
     model.fit(X[valid], y[valid])
-    fwd_ret = float(model.predict(X[-1].reshape(1, -1))[0])
+    x_last = X[-1].reshape(1, -1)
+    fwd_ret = float(model.predict(x_last)[0])
     importances = None
     if hasattr(model, "feature_importances_"):
         importances = sorted(
             zip(feature_cols, model.feature_importances_),
             key=lambda kv: kv[1], reverse=True,
         )[:6]
-    return fwd_ret, importances
+
+    extras = {}
+    # Signal attribution (price vs. news vs. geopolitics) from the fusion model.
+    if hasattr(model, "attribution"):
+        try:
+            contrib = model.attribution(X)
+            weights = getattr(model, "group_weights_", {})
+            extras["attribution"] = _format_attribution(contrib, weights)
+        except Exception:  # noqa: BLE001
+            log.debug("fusion attribution failed", exc_info=True)
+
+    # Probabilistic P10/P50/P90 band around the point forecast, trained on the
+    # same features/target. Robust and cheap; skipped silently on failure.
+    try:
+        bands = models.QuantileBands().fit(X[valid], y[valid])
+        b = bands.predict_bands(x_last)
+        last_price = float(close[-1])
+        extras["band"] = {
+            "p10_return_pct": round(float(b["p10"][0]) * 100, 2),
+            "p50_return_pct": round(float(b["p50"][0]) * 100, 2),
+            "p90_return_pct": round(float(b["p90"][0]) * 100, 2),
+            "p10_price": round(last_price * (1.0 + float(b["p10"][0])), 2),
+            "p50_price": round(last_price * (1.0 + float(b["p50"][0])), 2),
+            "p90_price": round(last_price * (1.0 + float(b["p90"][0])), 2),
+        }
+    except Exception:  # noqa: BLE001
+        log.debug("quantile bands failed", exc_info=True)
+
+    return fwd_ret, importances, extras
+
+
+def _format_attribution(contrib: dict, weights: dict) -> dict:
+    """Turn raw group contributions into a normalised, UI-friendly breakdown."""
+    total = sum(abs(v) for v in contrib.values()) or 1.0
+    parts = []
+    for group, value in sorted(contrib.items(), key=lambda kv: -abs(kv[1])):
+        parts.append({
+            "source": group,
+            "contribution_pct": round(value * 100, 3),   # signed return contribution
+            "share_pct": round(abs(value) / total * 100, 1),  # |share| of the move
+            "blend_weight_pct": round(float(weights.get(group, 0.0)) * 100, 1),
+            "direction": "up" if value >= 0 else "down",
+        })
+    return {"sources": parts}
 
 
 def _confidence(directional_acc: float, fwd_ret: float) -> float:
@@ -403,7 +464,7 @@ def _run_tier(df, horizons, sent_df, market_df, model_key, mode, base_cols,
             continue
 
         metrics, chart = _walk_forward(model_key, X, y, close, dates, last_valid,
-                                       H, _WF_FOLDS, min_rows=wf_min_rows)
+                                       H, _WF_FOLDS, min_rows=wf_min_rows, cols=cols)
         if metrics is None:
             continue
         # Benchmark the tier's model against the naive no-change baseline so we
@@ -411,7 +472,8 @@ def _run_tier(df, horizons, sent_df, market_df, model_key, mode, base_cols,
         base_metrics, _ = _walk_forward("naive", X, y, close, dates, last_valid,
                                         H, _WF_FOLDS, min_rows=wf_min_rows)
 
-        fwd_ret, importances = _forecast(model_key, X, y, last_valid, close, cols)
+        fwd_ret, importances, extras = _forecast(
+            model_key, X, y, last_valid, close, cols, H=H)
         if importances and (top_features is None or H == PRIMARY_HORIZON):
             top_features = [{"name": k, "importance": round(float(v), 3)}
                             for k, v in importances]
@@ -432,6 +494,10 @@ def _run_tier(df, horizons, sent_df, market_df, model_key, mode, base_cols,
             "metrics": metrics,
             "backtest": chart,
         }
+        if extras.get("band"):
+            row["forecast_band"] = extras["band"]
+        if extras.get("attribution"):
+            row["signal_attribution"] = extras["attribution"]
         if base_metrics is not None:
             row["baseline_comparison"] = {
                 "model": "naive",
@@ -490,9 +556,9 @@ def _predict_impl(base, symbol, exchange, model, horizons) -> dict:
     full_model_key = model
     if model == "auto":
         sel_h = min(horizons, key=lambda h: abs(h - PRIMARY_HORIZON))
-        Xs, ys, close_s, dates_s, lv_s, _ = features.make_supervised(df, sel_h, sent_df, market_df)
+        Xs, ys, close_s, dates_s, lv_s, cols_s = features.make_supervised(df, sel_h, sent_df, market_df)
         if len(Xs) >= settings.ml_min_rows:
-            full_model_key, scoreboard = _select_model(Xs, ys, close_s, dates_s, lv_s, sel_h)
+            full_model_key, scoreboard = _select_model(Xs, ys, close_s, dates_s, lv_s, sel_h, cols=cols_s)
             selected_from = "auto"
         else:
             full_model_key = None  # not enough for a full model; ladder handles it
@@ -588,6 +654,8 @@ def _predict_impl(base, symbol, exchange, model, horizons) -> dict:
         "confidence": primary["confidence"],
         "metrics": primary["metrics"],
         "backtest": primary["backtest"],
+        "forecast_band": primary.get("forecast_band"),
+        "signal_attribution": primary.get("signal_attribution"),
     }
 
     # Only persist fully validated, full-history models to disk. Weaker tiers

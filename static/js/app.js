@@ -399,7 +399,7 @@ function renderHorizon() {
       <div class="pstat"><div class="k">Confidence</div><div class="val">${fmt(h.confidence, 0)}%</div></div>
       <div class="pstat"><div class="k">Dir. accuracy</div><div class="val">${fmt(m.directional_accuracy_pct, 0)}%</div></div>
       <div class="pstat"><div class="k">Backtest err (MAE)</div><div class="val">±${fmt(m.mae_pct)}%</div></div>
-    </div>`;
+    </div>` + bandHtml(h.forecast_band) + attributionHtml(h.signal_attribution);
 
   $("predictFoot").textContent =
     `Trained on ${p.train_samples} samples (${p.history_days} trading days), ${p.trained_at || ""}. ` +
@@ -408,6 +408,49 @@ function renderHorizon() {
     ". Statistical estimate — not investment advice.";
 
   drawPredictChart(h.backtest, h.forecast_date, h.forecast_price, h.last_price);
+}
+
+// Probabilistic forecast band (P10 / P50 / P90) from the quantile model.
+function bandHtml(band) {
+  if (!band) return "";
+  const lo = band.p10_price, mid = band.p50_price, hi = band.p90_price;
+  const span = Math.max(hi - lo, 1e-6);
+  const midPct = Math.max(0, Math.min(100, ((mid - lo) / span) * 100));
+  return `
+    <div class="fc-band">
+      <div class="fc-band-head">Likely range in ${state.activeHorizon}d
+        <span class="fc-band-sub">80% confidence interval</span></div>
+      <div class="fc-band-track">
+        <div class="fc-band-fill"></div>
+        <div class="fc-band-mid" style="left:${midPct}%"></div>
+      </div>
+      <div class="fc-band-labels">
+        <span class="down">₹${fmt(lo)}<small>P10 ${fmt(band.p10_return_pct, 1)}%</small></span>
+        <span class="mid">₹${fmt(mid)}<small>median</small></span>
+        <span class="up">₹${fmt(hi)}<small>P90 +${fmt(band.p90_return_pct, 1)}%</small></span>
+      </div>
+    </div>`;
+}
+
+// Signal attribution: how much price vs. news vs. geopolitics drove the call.
+function attributionHtml(attr) {
+  if (!attr || !attr.sources || !attr.sources.length) return "";
+  const icon = { price: "📈", news: "📰", geopolitics: "🌍" };
+  const nice = { price: "Price / technicals", news: "Company news", geopolitics: "Geopolitics / macro" };
+  const rows = attr.sources.map((s) => {
+    const w = Math.max(0, Math.min(100, s.share_pct));
+    const dirCls = s.direction === "up" ? "up" : "down";
+    return `<div class="attr-row">
+        <div class="attr-name">${icon[s.source] || "•"} ${nice[s.source] || s.source}</div>
+        <div class="attr-bar"><div class="attr-fill ${dirCls}" style="width:${w}%"></div></div>
+        <div class="attr-val ${dirCls}">${s.share_pct}%</div>
+      </div>`;
+  }).join("");
+  return `<div class="attr-block">
+      <div class="attr-head">Signal attribution
+        <span class="attr-sub">share of the forecast move by data source</span></div>
+      ${rows}
+    </div>`;
 }
 
 function drawPredictChart(backtest, fDate, fPrice, lastPrice) {
@@ -725,8 +768,10 @@ async function loadStatus() {
 function pill(state, kind) {
   const good = ["ok", "closed", "reachable", "up_to_date"];
   const bad = ["error", "open", "degraded", "unreachable"];
+  const warn = ["limited", "empty", "breaker_open"];
   let cls = "neu";
   if (good.includes(state)) cls = "up";
+  else if (warn.includes(state)) cls = "neu";
   else if (bad.includes(state)) cls = "down";
   return `<span class="status-pill ${cls}">${state || "—"}</span>`;
 }
@@ -759,7 +804,11 @@ function renderStatus(d) {
   // Providers card.
   const ph = d.provider_health || [];
   const provRows = ph.length
-    ? ph.map((p) => `<div class="status-kv"><span>${p.name}</span>${pill(p.status)}</div>`).join("")
+    ? ph.map((p) => {
+        const note = p.detail ? ` title="${(p.detail || "").replace(/"/g, "&quot;")}"` : "";
+        const opt = p.optional ? ' <span class="prov-opt">fallback</span>' : "";
+        return `<div class="status-kv"${note}><span>${p.name}${opt}</span>${pill(p.status)}</div>`;
+      }).join("")
     : Object.entries(d.providers || {}).map(([k, v]) => `<div class="status-kv"><span>${k}</span>${pill(v)}</div>`).join("");
   cards.push(`<div class="status-card">
     <h3>🌐 Data Providers</h3>${provRows || "<div class='status-kv'><span>none</span></div>"}
